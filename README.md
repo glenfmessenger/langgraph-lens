@@ -412,23 +412,48 @@ python bench/bench.py --markdown
 
 **Test rig:** Apple M2 (8 cores), 8 GiB RAM, macOS 26.5, Python 3.13.7, LangGraph 1.2.1, LangChain Core 1.4.0. 2000 iterations per row, 200-iteration warm-up, GC disabled inside the timed loop. Single-threaded. Local laptop, not a production-class box — your absolute numbers will differ, but the *relative* costs (callback vs direct, with/without each Tier 2 feature) should be representative.
 
-### Whole-graph invoke — 5-node graph, ~4 KB state
+### How to read these numbers
 
-One full `app.invoke(...)` on a `StateGraph` with five sequential nodes and a `MemorySaver`. Baseline is the same graph with no lens at all.
+The lens cost is **roughly fixed at ~0.4 ms per `invoke` for Tier 1 and ~1 ms with all Tier 2 node-path features enabled** — it does not scale with the work your nodes do. So the percentage impact depends entirely on how much real work the nodes do:
+
+| Per-node work | Approx. invoke time | Tier 1 callback drop | All Tier 2 drop |
+|---|---|---|---|
+| Trivial (counter bump — synthetic bench below) | ~1.4 ms | ~22% | ~40% |
+| 10 ms each (cached lookup, tiny inference) | ~67 ms | ~2% | ~4% (measured below) |
+| 100 ms each (small DB query, embedding) | ~500 ms | ~0.3% | ~1% (extrapolated) |
+| 1 s each (LLM call) | ~5 s | ~0.03% | ~0.1% (extrapolated) |
+
+The headline `+21.6%` Tier 1 number in the synthetic table below is a worst case: it measures the lens overhead against nodes that do nothing. A real LangGraph deployment with even a single LLM call per node — which is the entire point of LangGraph — sees the lens overhead disappear into the noise of the LLM round-trip. The realistic-workload row, which simulates 10 ms of node work, brings that ~22% down to ~2% — and even 10 ms is much less than a real LLM call.
+
+If you are running a CPU-bound, no-LLM, no-I/O agent where every microsecond counts, prefer direct `lens.inspect_node(...)` calls (saves a few percentage points vs the callback) and leave `pii_redaction` off (it's the single most expensive Tier 2 feature — deep-copies state and re-serialises it). Otherwise, leave it on.
+
+### Synthetic: 5-node graph, ~4 KB state, no-op nodes
+
+One full `app.invoke(...)` on a `StateGraph` with five sequential nodes and a `MemorySaver`. Baseline is the same graph with no lens at all. **The "% drop" column is misleading in isolation** — see above for how it maps to real workloads.
 
 | Configuration | p50 latency | Overhead (p50) | Throughput drop |
 |---|---|---|---|
-| baseline (no lens) | 1.38 ms | — | — |
-| Tier 1 — callback handler | 1.74 ms | +0.36 ms | +19.1% |
-| Tier 1 — direct `Lens.inspect_node` in each node | 1.62 ms | +0.24 ms | +12.9% |
-| Tier 2 — `audit_signaling` only | 1.61 ms | +0.23 ms | +14.1% |
-| Tier 2 — `goal_guard` | 1.58 ms | +0.20 ms | +10.2% |
-| Tier 2 — `pii_redaction` | 2.29 ms | +0.92 ms | +38.4% |
-| Tier 2 — all node-path features (`audit + goal + pii + circuit`) | 2.31 ms | +0.94 ms | +39.7% |
+| baseline (no lens) | 1.36 ms | — | — |
+| Tier 1 — callback handler | 1.75 ms | +0.39 ms | +21.6% |
+| Tier 1 — direct `Lens.inspect_node` in each node | 1.64 ms | +0.28 ms | +16.2% |
+| Tier 2 — `audit_signaling` only | 1.61 ms | +0.24 ms | +14.6% |
+| Tier 2 — `goal_guard` | 1.59 ms | +0.22 ms | +12.6% |
+| Tier 2 — `pii_redaction` | 2.31 ms | +0.95 ms | +40.1% |
+| Tier 2 — all node-path features (`audit + goal + pii + circuit`) | 2.31 ms | +0.95 ms | +40.3% |
 
-The callback path is slightly more expensive than direct inspection because LangChain's callback manager dispatches a `RunManager` per node — the lens itself runs the same code in both cases. The callback handler filters to real LangGraph nodes (via the `langgraph_node` metadata key) and only emits the egress event once at the outer run boundary, which avoids 7 of the 12 callback fires LangChain would otherwise dispatch for a 5-node graph; that filter is what closes the gap to the direct path.
+Why callback ≥ direct: LangChain's callback manager dispatches a `RunManager` for every chain boundary. `LensCallback` already filters to real LangGraph nodes (via the `langgraph_node` metadata key) and only fires the egress event once at the outer run boundary — without that filter the call count is 12 per invoke instead of 6, and the cost roughly doubles.
 
-`pii_redaction` is the most expensive Tier 2 feature on the node path: it deep-copies the state, walks the message list, runs every configured pattern, and re-serialises the modified copy. If you don't need redaction, leaving it off is the single biggest perf win.
+### Realistic: same graph, 10 ms simulated work per node
+
+Each node sleeps 10 ms before returning, simulating the floor of a real LangGraph deployment (cached lookup, tiny model). At 200 iterations because each invoke takes ~67 ms.
+
+| Configuration | p50 latency | Overhead (p50) | Throughput drop |
+|---|---|---|---|
+| realistic baseline (10 ms / node) | 67.19 ms | — | — |
+| realistic + Tier 1 callback handler | 68.40 ms | +1.21 ms | +1.9% |
+| realistic + Tier 2 (all node-path features) | 70.28 ms | +3.09 ms | +4.4% |
+
+For an LLM-backed agent with 500 ms-3 s of LLM time per node, those percentages shrink by another order of magnitude. **In practice the question is "do I want the observability and the controls" — not "can I afford the latency."**
 
 ### Standalone Tier 1 / Tier 2 cost — single tool call
 
@@ -436,10 +461,10 @@ These rows are the absolute cost of one `lens.inspect_tool_call(...)` or `lens.d
 
 | Configuration | p50 latency / call |
 |---|---|
-| Tier 1 — `inspect_tool_call` | 22.0 µs |
-| Tier 2 — `tool_allowlist` (via `decide_tool_call`) | 78.8 µs |
-| Tier 2 — `rate_limit` (via `decide_tool_call`) | 26.0 µs |
-| Tier 2 — all tool-path features (`allowlist + rate_limit + circuit + audit`) | 83.0 µs |
+| Tier 1 — `inspect_tool_call` | 25.6 µs |
+| Tier 2 — `tool_allowlist` (via `decide_tool_call`) | 77.2 µs |
+| Tier 2 — `rate_limit` (via `decide_tool_call`) | 26.5 µs |
+| Tier 2 — all tool-path features (`allowlist + rate_limit + circuit + audit`) | 82.1 µs |
 
 `tool_allowlist` is the most expensive tool-path intervention because it re-runs the entire Tier 1 misuse-detection set (shell-metachar, SSRF, oversized args) against the args. `rate_limit` is essentially free.
 
@@ -449,9 +474,9 @@ A 60-byte JSON checkpoint blob (no pickle, no large state). The cost scales with
 
 | Configuration | p50 latency / checkpoint |
 |---|---|
-| Tier 1 — `inspect_checkpoint` | 3.6 µs |
-| Tier 2 — `checkpoint_protector` | 5.4 µs |
-| Tier 2 — `checkpoint_protector + require_hmac` | 7.0 µs |
+| Tier 1 — `inspect_checkpoint` | 3.4 µs |
+| Tier 2 — `checkpoint_protector` | 5.3 µs |
+| Tier 2 — `checkpoint_protector + require_hmac` | 6.8 µs |
 
 ---
 

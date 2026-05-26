@@ -71,27 +71,40 @@ def _node(state: S) -> S:
     return {**state, "counter": state.get("counter", 0) + 1}
 
 
+def _realistic_node(state: S) -> S:
+    """Simulate a node that does actual work — an LLM call, a vector
+    search, a tool invocation — by sleeping for a short interval. 10 ms
+    per node is on the low end of realistic for an LLM-backed agent;
+    real workloads are usually 100 ms - 2 s per LLM-bound node.
+    """
+    time.sleep(0.010)
+    return {**state, "counter": state.get("counter", 0) + 1}
+
+
 def _build_graph(
     *,
     lens: Lens | None = None,
     wrap_for_redact: bool = False,
     direct_inspect: bool = False,
+    node_fn: Callable[[S], S] = _node,
 ) -> Any:
     g = StateGraph(S)
     names = [f"n{i}" for i in range(5)]
     for n in names:
         if lens and wrap_for_redact:
-            fn = wrap_node(lens, _node, node=n)
+            fn = wrap_node(lens, node_fn, node=n)
         elif lens and direct_inspect:
             # Inside-node direct inspection — what a power user would
             # do who doesn't want to go through the callback at all.
-            def _direct(state: S, _name: str = n, _lens: Lens = lens) -> S:
+            def _direct(
+                state: S, _name: str = n, _lens: Lens = lens, _inner: Callable[[S], S] = node_fn
+            ) -> S:
                 _lens.inspect_node(node=_name, state=state, thread_id="b")
-                return _node(state)
+                return _inner(state)
 
             fn = _direct
         else:
-            fn = _node
+            fn = node_fn
         g.add_node(n, fn)
     g.set_entry_point(names[0])
     for a, b in zip(names, names[1:], strict=False):
@@ -152,6 +165,47 @@ def bench_graph_baseline(iterations: int) -> Result:
         app.invoke(state, config={"configurable": {"thread_id": "b"}})
 
     return _time("baseline (no lens)", fn, iterations)
+
+
+def bench_realistic_baseline(iterations: int) -> Result:
+    app = _build_graph(node_fn=_realistic_node)
+    state = _build_4kb_state()
+
+    def fn() -> None:
+        app.invoke(state, config={"configurable": {"thread_id": "b"}})
+
+    return _time("realistic baseline (10 ms / node)", fn, iterations)
+
+
+def bench_realistic_t1_callback(iterations: int) -> Result:
+    lens = Lens(_quiet_cfg())
+    app = _build_graph(node_fn=_realistic_node)
+    state = _build_4kb_state()
+    cb = LensCallback(lens)
+
+    def fn() -> None:
+        app.invoke(
+            state,
+            config={"configurable": {"thread_id": "b"}, "callbacks": [cb]},
+        )
+
+    return _time("realistic + Tier 1 callback handler", fn, iterations)
+
+
+def bench_realistic_t2_all(iterations: int) -> Result:
+    cfg = _quiet_cfg()
+    cfg.tier2.goal_guard.enabled = True
+    cfg.tier2.pii_redaction.enabled = True
+    cfg.tier2.audit_signaling.enabled = True
+    cfg.tier2.circuit_breaker.enabled = True
+    lens = Lens(cfg)
+    app = _build_graph(lens=lens, wrap_for_redact=True, node_fn=_realistic_node)
+    state = _build_4kb_state()
+
+    def fn() -> None:
+        app.invoke(state, config={"configurable": {"thread_id": "b"}})
+
+    return _time("realistic + Tier 2 (all node-path features)", fn, iterations)
 
 
 def bench_graph_t1_callback(iterations: int) -> Result:
@@ -340,9 +394,12 @@ def _delta(measured: Result, baseline: Result) -> tuple[float, float]:
 
 
 def _print_graph_section(
-    baseline: Result, rows: list[Result], *, markdown: bool
+    baseline: Result,
+    rows: list[Result],
+    *,
+    markdown: bool,
+    title: str = "5-node graph, ~4 KB state — one full `app.invoke(...)`",
 ) -> None:
-    title = "5-node graph, ~4 KB state — one full `app.invoke(...)`"
     if markdown:
         print(f"\n### {title}\n")
         print("| Configuration | p50 latency | Overhead (p50) | Throughput drop |")
@@ -410,6 +467,25 @@ def main(argv: list[str] | None = None) -> int:
         bench_graph_t2_all(iters),
     ]
     _print_graph_section(base, graph_rows, markdown=args.markdown)
+
+    # Realistic node — what users will actually see in production once
+    # nodes do real LLM/DB/tool work. Use fewer iterations because each
+    # invoke is ~10× slower.
+    real_iters = max(200, iters // 10)
+    real_base = bench_realistic_baseline(real_iters)
+    real_rows = [
+        bench_realistic_t1_callback(real_iters),
+        bench_realistic_t2_all(real_iters),
+    ]
+    _print_graph_section(
+        real_base,
+        real_rows,
+        markdown=args.markdown,
+        title=(
+            f"Realistic workload — 5 nodes × 10 ms simulated work "
+            f"({real_iters} iterations)"
+        ),
+    )
 
     tool_rows = [
         bench_tool_t1(iters),
