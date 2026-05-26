@@ -1,0 +1,4 @@
+name: synthetic-cve-2026-34070-canary
+description: Synthetic canary for the langgraph-lens supply_chain/jinja_ssti rule.
+template_format: jinja2
+input_variables: [user_input]

@@ -1,0 +1,145 @@
+# langgraph-lens default config.
+#
+# Tier 1 (observability) is enabled by default — `LANGGRAPH_LENS=1` alone
+# gives you everything in this file. Every detector below defaults to
+# enabled; this file exists for tuning, not for turning things on.
+#
+# Tier 2 (interventions — block / redact / enforce) is out of scope for
+# this release. A separate `langgraph-lens-tier2` package is planned.
+
+# ---------------------------------------------------------------------------
+# Tier 1 — observability (zero-config defaults)
+# ---------------------------------------------------------------------------
+
+attack_surface:
+  enabled: true
+  rules:
+    - pickle_checkpoint_backend
+    - unsigned_prompt_registry
+    - jinja2_template_format
+    - permissive_recursion_limit
+    - server_without_auth
+
+checkpoint:
+  enabled: true
+  scan_on_write: true
+  scan_on_read: true
+  rules:
+    - unsafe_pickle_opcode
+    - unknown_serializer_kind
+    - missing_thread_id
+    - schema_drift
+    - oversized_blob
+  max_blob_bytes: 10485760  # 10 MiB
+
+supply_chain:
+  enabled: true
+  scan_on_load: true
+  formats:
+    - jinja2
+    - f_string
+    - mustache
+    - prompt_dir
+  rules:
+    - jinja_ssti
+    - path_traversal
+    - unsafe_chat_template
+    - unsigned_hub_pull
+
+tool:
+  enabled: true
+  rules:
+    - shell_metachar
+    - ssrf_pattern
+    - out_of_allowlist
+    - enumeration
+    - oversized_args
+  enumeration_window_seconds: 30
+  enumeration_threshold: 8
+  max_arg_bytes: 65536
+
+memory:
+  enabled: true
+  rules:
+    - system_prompt_override
+    - oversized_entry
+    - cross_tenant_key
+  max_entry_bytes: 32768
+
+pii:
+  enabled: true
+  scan_ingress: true
+  scan_egress: true
+  scan_checkpoints: true
+  patterns:
+    - type: ssn
+    - type: credit_card
+    - type: phone_us
+    - type: phone_intl
+    - type: email
+    - type: ip_address
+  custom_patterns: []
+
+goal_hijack:
+  enabled: true
+  rules:
+    - system_prompt_drift
+    - tool_call_drift
+    - off_topic_subgoal
+  user_intent_similarity_threshold: 0.35
+  watch_substrings:
+    - transfer funds
+    - send money
+    - delete account
+    - exfiltrate
+    - curl http
+    - wget http
+
+comms:
+  enabled: true
+  rules:
+    - undeclared_edge
+    - recursion_exceeded
+    - send_to_undeclared_target
+    - oversized_state_growth
+  state_growth_multiplier: 10.0
+
+sql_injection:
+  enabled: true
+  rules:
+    - union_select
+    - comment_terminator
+    - stacked_query
+    - metadata_escape
+  fields:
+    - thread_id
+    - checkpoint_ns
+    - checkpoint_id
+
+prometheus:
+  enabled: true
+  port: 9092
+
+logging:
+  enabled: true
+  destination: stderr
+  file_path: /var/log/langgraph-lens.jsonl
+  format: json
+  include_match_text: false
+
+alerts:
+  enabled: false
+  slack_webhook: ""
+  cooldown_seconds: 300
+  alert_on:
+    - supply_chain
+    - attack_surface
+    - checkpoint
+    - goal_hijack
+
+otel:
+  enabled: false
+  endpoint: http://localhost:4318
+  service_name: langgraph-agent
+  export_traces: true
+  export_metrics: true

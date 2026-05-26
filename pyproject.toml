@@ -1,0 +1,87 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "langgraph-lens"
+version = "0.1.0"
+description = "Zero-config runtime observability for LangGraph agents: checkpoint, prompt-supply-chain, tool, memory, PII, goal-hijack, inter-agent, and SQL-injection detectors emitted as structured events."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Glen Messenger" }]
+keywords = ["langgraph", "langchain", "agent", "observability", "security", "pii"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Monitoring",
+    "Topic :: Security",
+]
+dependencies = [
+    "pydantic>=2.6",
+    "PyYAML>=6.0",
+    "prometheus-client>=0.19",
+    "regex>=2024.4.16",
+]
+
+[project.optional-dependencies]
+langgraph = [
+    "langgraph>=0.2.50",
+    "langchain-core>=0.3.0",
+]
+otel = [
+    "opentelemetry-api>=1.24",
+    "opentelemetry-sdk>=1.24",
+    "opentelemetry-exporter-otlp-proto-http>=1.24",
+]
+postgres = ["langgraph-checkpoint-postgres>=2.0"]
+sqlite = ["langgraph-checkpoint-sqlite>=2.0"]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=4.1",
+    "ruff>=0.4.0",
+    "mypy>=1.10",
+    "types-PyYAML",
+]
+
+[project.scripts]
+langgraph-lens = "langgraph_lens.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/glenfmessenger/langgraph-lens"
+Issues = "https://github.com/glenfmessenger/langgraph-lens/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+langgraph_lens = ["py.typed"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = [
+    "opentelemetry.*",
+    "langchain_core.tracers.context",
+]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"

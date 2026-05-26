@@ -1,0 +1,8 @@
+You are a helpful assistant.
+
+{# SYNTHETIC CANARY: matches the canonical CVE-2026-34070 SSTI signature.
+   This is NOT a working payload — the detector flags the shape, not the effect. #}
+{{ ''.__class__.__mro__[1].__subclasses__() }}
+
+User: {{ user_input }}
+Assistant:
