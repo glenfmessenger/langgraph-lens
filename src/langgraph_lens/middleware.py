@@ -17,14 +17,19 @@ Two attachment paths:
 
 from __future__ import annotations
 
+import functools
 import sys
 import traceback
-from typing import TYPE_CHECKING, Any
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from .config import LensConfig
+from .interventions import LensBlockedError
 
 if TYPE_CHECKING:
     from .lens import Lens
+
+F = TypeVar("F", bound=Callable[..., Any])
 
 
 # Try to import the real BaseCallbackHandler. If LangChain isn't installed
@@ -105,9 +110,10 @@ class LensCallback(BaseCallbackHandler):
     raise_error = False
     run_inline = True
 
-    def __init__(self, lens: Lens) -> None:
+    def __init__(self, lens: Lens, *, enforce_blocks: bool = False) -> None:
         super().__init__()
         self.lens = lens
+        self.enforce_blocks = enforce_blocks
         self._tool_allowlist: list[str] | None = None
 
     # -- LangChain hooks. All wrapped in `_safe` so detector errors never
@@ -171,12 +177,30 @@ class LensCallback(BaseCallbackHandler):
     ) -> None:
         tool_name = (serialized or {}).get("name", "<unknown>")
         args: dict[str, Any] | str = inputs if isinstance(inputs, dict) else input_str
+        thread_id = _thread_id_from(metadata, kwargs)
+
+        if self.enforce_blocks and self.lens.config.tier2.any_enabled:
+            # Tier 2 path — `decide_tool_call` runs detectors *and*
+            # interventions, and we raise on any terminal decision.
+            def _decide() -> None:
+                decision, _event = self.lens.decide_tool_call(
+                    tool=tool_name,
+                    args=args,
+                    run_id=_stringify(run_id),
+                    thread_id=thread_id,
+                )
+                if decision.is_terminal:
+                    raise LensBlockedError(decision)
+
+            self._safe_or_raise(_decide)
+            return
+
         self._safe(
             lambda: self.lens.inspect_tool_call(
                 tool=tool_name,
                 args=args,
                 run_id=_stringify(run_id),
-                thread_id=_thread_id_from(metadata, kwargs),
+                thread_id=thread_id,
                 allowed_tools=self._tool_allowlist,
             )
         )
@@ -212,6 +236,65 @@ class LensCallback(BaseCallbackHandler):
         except Exception:  # noqa: BLE001 -- intentional: never raise into the agent loop
             print("[langgraph-lens] detector error (suppressed):", file=sys.stderr)
             traceback.print_exc(file=sys.stderr)
+
+    @staticmethod
+    def _safe_or_raise(fn: Any) -> None:
+        """Like `_safe`, but lets `LensBlockedError` propagate so Tier 2
+        `block` decisions actually terminate the call.
+        """
+        try:
+            fn()
+        except LensBlockedError:
+            raise
+        except Exception:  # noqa: BLE001
+            print("[langgraph-lens] detector error (suppressed):", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+
+
+def wrap_node(
+    lens: Lens,
+    fn: F,
+    *,
+    node: str | None = None,
+    declared_tools: list[str] | None = None,
+) -> F:
+    """Wrap a LangGraph node function so Tier 2 interventions can rewrite
+    state before the node runs and block execution if a terminal
+    decision fires.
+
+    Callbacks alone can observe a node but not modify its state. For
+    Tier 2 `redact` to actually scrub PII before the node sees it, the
+    node must be wrapped — either with this helper or by calling
+    `lens.decide_node(...)` manually inside your node body.
+
+    Usage:
+
+        graph.add_node("act", wrap_node(lens, act, node="act"))
+
+    Idempotent: applying `wrap_node` twice is harmless — the inner
+    wrapper short-circuits when it sees its own marker attribute.
+    """
+    if getattr(fn, "__lens_wrapped__", False):
+        return fn
+
+    @functools.wraps(fn)
+    def _wrapped(state: dict[str, Any], *args: Any, **kwargs: Any) -> Any:
+        config = kwargs.get("config") if isinstance(kwargs.get("config"), dict) else {}
+        configurable = (config or {}).get("configurable") or {}
+        thread_id = configurable.get("thread_id") if isinstance(configurable, dict) else None
+        decision, _event = lens.decide_node(
+            node=node or fn.__name__,
+            state=state if isinstance(state, dict) else {"input": state},
+            thread_id=thread_id if isinstance(thread_id, str) else None,
+        )
+        if decision.is_terminal:
+            raise LensBlockedError(decision)
+        if decision.modified_state is not None:
+            state = decision.modified_state
+        return fn(state, *args, **kwargs)
+
+    _wrapped.__lens_wrapped__ = True  # type: ignore[attr-defined]
+    return _wrapped  # type: ignore[return-value]
 
 
 def _node_name(

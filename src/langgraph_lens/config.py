@@ -208,6 +208,112 @@ class OtelConfig(BaseModel):
     export_metrics: bool = True
 
 
+# ---------------------------------------------------------------------------
+# Tier 2 — interventions. All `enabled: False` by default. Nothing here does
+# anything unless you explicitly turn it on.
+# ---------------------------------------------------------------------------
+
+
+class PIIRedactionConfig(BaseModel):
+    enabled: bool = False
+    mode: Literal["redact", "block"] = "redact"
+    patterns: list[PIIPattern] = Field(
+        default_factory=lambda: [
+            PIIPattern(type="ssn"),
+            PIIPattern(type="credit_card"),
+            PIIPattern(type="email"),
+            PIIPattern(type="phone_us"),
+            PIIPattern(type="phone_intl"),
+            PIIPattern(type="ip_address"),
+        ]
+    )
+    custom_patterns: list[PIIPattern] = Field(default_factory=list)
+
+
+class ToolAllowlistConfig(BaseModel):
+    enabled: bool = False
+    mode: Literal["block", "log"] = "block"
+    allowed_tools: list[str] | None = None
+    block_on_rules: list[str] = Field(
+        default_factory=lambda: ["shell_metachar", "ssrf_pattern", "oversized_args"]
+    )
+
+
+class CheckpointProtectorConfig(BaseModel):
+    enabled: bool = False
+    mode: Literal["enforce", "log"] = "enforce"
+    block_on_rules: list[str] = Field(
+        default_factory=lambda: ["unsafe_pickle_opcode"]
+    )
+    require_hmac: bool = False
+    signing_key: str = ""
+
+
+class GoalGuardConfig(BaseModel):
+    enabled: bool = False
+    mode: Literal["block", "log"] = "block"
+    block_on_rules: list[str] = Field(
+        default_factory=lambda: ["system_prompt_drift", "tool_call_drift"]
+    )
+
+
+class RateLimitConfig(BaseModel):
+    enabled: bool = False
+    mode: Literal["throttle", "block"] = "throttle"
+    capacity: float = 60.0
+    refill_per_second: float = 1.0
+    size_divisor: int = 1000  # chars of args per extra token of cost
+    key_by_tenant: bool = True
+    key_by_thread: bool = True
+    key_by_tool: bool = False
+
+
+class CircuitBreakerConfig(BaseModel):
+    enabled: bool = False
+    window_seconds: int = 30
+    min_samples: int = 20
+    error_rate_threshold: float = 0.5  # 0..1
+    cooldown_seconds: int = 30
+
+    fail_closed_on_attack: bool = False
+    fail_closed_min_severity: Literal["low", "medium", "high", "critical"] = "high"
+    fail_closed_attack_window_seconds: int = 60
+    fail_closed_min_attack_signals: int = 5
+
+
+class AuditSignalingConfig(BaseModel):
+    enabled: bool = False
+    triggered_header: str = "X-Lens-Triggered"
+    reason_header: str = "X-Lens-Reason"
+    action_header: str = "X-Lens-Action"
+    stamp_state: bool = False
+
+
+class Tier2Config(BaseModel):
+    pii_redaction: PIIRedactionConfig = Field(default_factory=PIIRedactionConfig)
+    tool_allowlist: ToolAllowlistConfig = Field(default_factory=ToolAllowlistConfig)
+    checkpoint_protector: CheckpointProtectorConfig = Field(
+        default_factory=CheckpointProtectorConfig
+    )
+    goal_guard: GoalGuardConfig = Field(default_factory=GoalGuardConfig)
+    rate_limit: RateLimitConfig = Field(default_factory=RateLimitConfig)
+    circuit_breaker: CircuitBreakerConfig = Field(default_factory=CircuitBreakerConfig)
+    audit_signaling: AuditSignalingConfig = Field(default_factory=AuditSignalingConfig)
+
+    @property
+    def any_enabled(self) -> bool:
+        return any(
+            (
+                self.pii_redaction.enabled,
+                self.tool_allowlist.enabled,
+                self.checkpoint_protector.enabled,
+                self.goal_guard.enabled,
+                self.rate_limit.enabled,
+                self.circuit_breaker.enabled,
+            )
+        )
+
+
 class LensConfig(BaseModel):
     attack_surface: AttackSurfaceConfig = Field(default_factory=AttackSurfaceConfig)
     checkpoint: CheckpointConfig = Field(default_factory=CheckpointConfig)
@@ -222,6 +328,7 @@ class LensConfig(BaseModel):
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     alerts: AlertsConfig = Field(default_factory=AlertsConfig)
     otel: OtelConfig = Field(default_factory=OtelConfig)
+    tier2: Tier2Config = Field(default_factory=Tier2Config)
 
     @classmethod
     def default(cls) -> LensConfig:

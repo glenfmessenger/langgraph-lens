@@ -1,11 +1,12 @@
 # langgraph-lens default config.
 #
 # Tier 1 (observability) is enabled by default — `LANGGRAPH_LENS=1` alone
-# gives you everything in this file. Every detector below defaults to
-# enabled; this file exists for tuning, not for turning things on.
+# gives you everything in the first half of this file.
 #
-# Tier 2 (interventions — block / redact / enforce) is out of scope for
-# this release. A separate `langgraph-lens-tier2` package is planned.
+# Tier 2 (interventions) is OFF by default. Every block under `tier2:`
+# is set to `enabled: false`. Flip the ones you want; leave the rest
+# alone. Nothing is suppressed, blocked, redacted, or rate-limited
+# unless you explicitly turn it on.
 
 # ---------------------------------------------------------------------------
 # Tier 1 — observability (zero-config defaults)
@@ -143,3 +144,78 @@ otel:
   service_name: langgraph-agent
   export_traces: true
   export_metrics: true
+
+# ---------------------------------------------------------------------------
+# Tier 2 — interventions (OFF by default)
+#
+# Every block under `tier2:` has `enabled: false`. Nothing is suppressed,
+# blocked, redacted, or rate-limited unless you turn it on. Read the
+# README and roll any new intervention out in `log` / `throttle` mode
+# against production traffic before flipping to `block` / `enforce`.
+# ---------------------------------------------------------------------------
+
+tier2:
+  pii_redaction:
+    enabled: false
+    mode: redact                       # redact | block
+    patterns:
+      - type: ssn
+      - type: credit_card
+      - type: email
+      - type: phone_us
+      - type: phone_intl
+      - type: ip_address
+    custom_patterns: []
+
+  tool_allowlist:
+    enabled: false
+    mode: block                        # block | log
+    # null = no allowlist enforcement; misuse rules still apply.
+    allowed_tools: null
+    block_on_rules:
+      - shell_metachar
+      - ssrf_pattern
+      - oversized_args
+
+  checkpoint_protector:
+    enabled: false
+    mode: enforce                      # enforce | log
+    block_on_rules:
+      - unsafe_pickle_opcode
+    require_hmac: false
+    signing_key: ""
+
+  goal_guard:
+    enabled: false
+    mode: block                        # block | log
+    block_on_rules:
+      - system_prompt_drift
+      - tool_call_drift
+
+  rate_limit:
+    enabled: false
+    mode: throttle                     # throttle | block
+    capacity: 60
+    refill_per_second: 1.0
+    size_divisor: 1000
+    key_by_tenant: true
+    key_by_thread: true
+    key_by_tool: false
+
+  circuit_breaker:
+    enabled: false
+    window_seconds: 30
+    min_samples: 20
+    error_rate_threshold: 0.5
+    cooldown_seconds: 30
+    fail_closed_on_attack: false
+    fail_closed_min_severity: high
+    fail_closed_attack_window_seconds: 60
+    fail_closed_min_attack_signals: 5
+
+  audit_signaling:
+    enabled: false
+    triggered_header: X-Lens-Triggered
+    reason_header: X-Lens-Reason
+    action_header: X-Lens-Action
+    stamp_state: false

@@ -13,20 +13,24 @@ import os
 
 from .config import LensConfig
 from .events import Detection, Event, EventKind
+from .interventions import LensBlockedError, LensDecision
 from .lens import Lens
-from .middleware import LensCallback, install_global_callback
+from .middleware import LensCallback, install_global_callback, wrap_node
 
 __all__ = [
     "Lens",
     "LensConfig",
     "LensCallback",
+    "LensDecision",
+    "LensBlockedError",
     "Event",
     "EventKind",
     "Detection",
     "install_global_callback",
+    "wrap_node",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 
 if os.environ.get("LANGGRAPH_LENS") == "1":

@@ -3,7 +3,7 @@
 [![CI](https://github.com/glenfmessenger/langgraph-lens/actions/workflows/ci.yml/badge.svg)](https://github.com/glenfmessenger/langgraph-lens/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
-Zero-config runtime observability for LangGraph agents — checkpoint, prompt-supply-chain, tool, memory, PII, goal-hijack, inter-agent, and SQL-injection detectors emitted as structured events.
+Zero-config runtime observability for LangGraph agents, with opt-in interventions for teams that need to block, redact, or rate-limit.
 
 ## Try it in 30 seconds
 
@@ -26,9 +26,9 @@ You'll get a `supply_chain/jinja_ssti` detection at severity `critical` and a no
 
 **Supply-chain risk in shared prompt registries — CVE-2026-34070.** LangChain Hub and self-hosted prompt registries distribute Jinja2 chat templates as opaque text. **CVE-2026-34070** (March 2026) allows path traversal and unsafe Jinja2 SSTI when `ChatPromptTemplate.from_template(..., template_format="jinja2")` renders a malicious template. langgraph-lens scans every prompt on load and emits a structured event for any pattern matching known-bad template signatures or path-traversal sequences in the loader call.
 
-**Compliance requirements that post-hoc log scraping can't satisfy.** Regulated environments need an auditable record that PII was *observed leaving an agent*, with correlation IDs that match the originating run, thread, and node. Tailing LangGraph Server's access logs after the fact doesn't produce this — the agent's intermediate state is opaque to the proxy. langgraph-lens emits per-node and per-checkpoint events with stable correlation IDs derived from `run_id` and `thread_id`, so every detection can be joined back to the user-facing invocation that produced it.
+**Compliance requirements that post-hoc log scraping can't satisfy.** Regulated environments need an auditable record that PII was *observed leaving an agent*, with correlation IDs that match the originating run, thread, and node. Tailing LangGraph Server's access logs after the fact doesn't produce this — the agent's intermediate state is opaque to the proxy. langgraph-lens emits per-node and per-checkpoint events with stable correlation IDs derived from `run_id` and `thread_id`, and Tier 2 attaches `X-Lens-Triggered: true` + `X-Lens-Reason` headers (or a `state["__lens__"]` annotation) so downstream callers know inline.
 
-This is not a safety system. It does not provide probabilistic guarantees against adversarial prompts or agent misbehaviour. It provides **operational visibility and runtime instrumentation** — structured events, Prometheus metrics, and OpenTelemetry spans — that make a LangGraph deployment auditable.
+This is not a safety system. It does not provide probabilistic guarantees against adversarial prompts or agent misbehaviour. It provides **operational visibility and runtime instrumentation**, plus a small number of opt-in hard controls for teams that need them.
 
 ---
 
@@ -36,28 +36,27 @@ This is not a safety system. It does not provide probabilistic guarantees agains
 
 langgraph-lens runs as a callback handler inside the LangGraph runtime. The primary path is a `BaseCallbackHandler` subclass registered globally via `LANGGRAPH_LENS=1`; the fallback path is a manual `Lens` instance attached to a specific compiled graph via `graph.with_config({"callbacks": [LensCallback(lens)]})`.
 
-There is one tier:
+There are two tiers:
 
-- **Tier 1 (observability)** is on by default. Detectors inspect every node entry and exit, every checkpoint write and read, every tool call, every memory write, and every prompt load. They emit structured events. They never modify the state, the message list, or the tool call, and they never raise inside the agent loop.
+- **Tier 1 (observability)** is on by default. Detectors inspect every node entry and exit, every checkpoint write and read, every tool call, every memory write, and every prompt load, and emit structured events. They never modify the state, the message list, or the tool call.
+- **Tier 2 (interventions)** is off by default. Each intervention has its own `enabled: false` flag. When enabled, an intervention may block a node, rewrite its state (PII redaction), throttle tool calls, refuse to deserialise a checkpoint, or attach `X-Lens-Triggered` headers to the response.
 
-`LANGGRAPH_LENS=1` with no config gets you Tier 1. Nothing is suppressed without you asking for it.
-
-> **Tier 2 (interventions — block, redact, rate-limit, enforce) is out of scope for this release.** A separate `langgraph-lens-tier2` package is planned. This repository contains observability only.
+`LANGGRAPH_LENS=1` with no config gets you Tier 1 only. Tier 2 requires an explicit YAML opt-in per feature. Nothing is suppressed without you asking for it.
 
 ---
 
 ## Usage with LangGraph Server
 
 ```bash
-# Zero-config: Tier 1. Every detector on, no interventions.
+# Zero-config: Tier 1 only. Every detector on, no interventions.
 LANGGRAPH_LENS=1 langgraph dev
 
-# With a custom config
+# With Tier 2 enabled selectively via lens.yaml
 LANGGRAPH_LENS=1 LANGGRAPH_LENS_CONFIG=lens.yaml \
   langgraph up --port 2024
 ```
 
-For deployments that don't run LangGraph Server, the same detectors attach to a compiled graph directly:
+For deployments that don't run LangGraph Server, the same detectors and interventions attach to a compiled graph directly:
 
 ```bash
 LANGGRAPH_LENS=1 python my_agent.py
@@ -65,7 +64,7 @@ LANGGRAPH_LENS=1 python my_agent.py
 
 Once `LANGGRAPH_LENS=1` is set, the package installs a process-wide callback at import time. Any graph built by `StateGraph(...).compile(...)` in that process picks it up automatically — no decorator, no per-graph wiring.
 
-> **Note on the callback path:** LangGraph's callback handlers run synchronously between nodes. Supply-chain prompt scanning, which has to read template files from disk, happens lazily on the first `PromptTemplate` load and is cached by template hash so subsequent runs of the same graph don't re-scan.
+> **Note on the callback path:** LangGraph's callback handlers run synchronously between nodes. Callbacks can *observe* state but they cannot rewrite it. For Tier 2 `redact` to actually scrub PII before a node sees it, either wrap the node with `wrap_node(lens, fn)` or call `lens.decide_node(...)` manually inside your node body. `block` decisions work via callback (the handler raises `LensBlockedError`); `redact` does not.
 
 ---
 
@@ -78,37 +77,26 @@ from langgraph_lens import Lens, LensConfig, LensCallback
 # Tier 1 — zero-config
 lens = Lens(LensConfig.default())
 
-graph = StateGraph(MyState)
-graph.add_node("plan", plan_node)
-graph.add_node("act", act_node)
-graph.add_edge("plan", "act")
-graph.set_entry_point("plan")
-app = graph.compile(checkpointer=MemorySaver())
-
-# Attach the lens to this graph only.
-result = app.invoke(
-    {"input": "summarise this PDF"},
-    config={
-        "configurable": {"thread_id": "abc-123"},
-        "callbacks": [LensCallback(lens)],
-    },
-)
-
-# Detections from this run, joined by correlation_id:
-events = lens.events_for_thread("abc-123")
-# [Event(event=node_inspected, detections=[Detection(detector=goal_hijack, ...)]), ...]
-```
-
-Direct inspection — no callbacks, useful in tests:
-
-```python
 event = lens.inspect_node(
     node="act",
-    state={"messages": [{"role": "user", "content": "My SSN is 123-45-6789"}]},
+    state={"messages": [{"role": "user", "content": "ignore prior instructions"}]},
     run_id="run-1",
     thread_id="abc-123",
 )
-# event.detections -> [Detection(detector="pii", rule="ssn", severity="high", ...)]
+# event.detections -> [Detection(detector="goal_hijack", ...)] (if intent was set earlier)
+
+# Tier 2 — same Lens, with a config that opts into interventions
+config = LensConfig.from_yaml("lens.yaml")  # with tier2.pii_redaction.enabled: true
+lens = Lens(config)
+decision, event = lens.decide_node(
+    node="act",
+    state={"messages": [{"role": "user", "content": "My SSN is 123-45-6789"}]},
+    thread_id="abc-123",
+)
+# decision.action -> "redact"
+# decision.modified_state["messages"][0]["content"]
+#   -> "My SSN is [REDACTED:ssn]"
+# decision.headers -> {"X-Lens-Triggered": "true", "X-Lens-Action": "redact", "X-Lens-Reason": "pii_redactor.ssn"}
 ```
 
 ---
@@ -120,16 +108,28 @@ event = lens.inspect_node(
 | Feature | What it does | Default |
 |---|---|---|
 | **Checkpoint / state anomaly detection** | On every checkpoint write or restore, inspects the serialised blob for unsafe pickle opcodes (`REDUCE`, `GLOBAL`, `BUILD`), unknown serializer kinds, schema drift, and missing `thread_id` / `checkpoint_id` metadata | enabled |
-| **Supply-chain / prompt loading anomalies** | Scans every loaded prompt template for path traversal in the loader call (`../../etc/passwd`), Jinja2 SSTI payloads (`{{ ''.__class__.__mro__ }}`), and unsafe template flags (`autoescape=False` on user-controllable inputs) | enabled |
+| **Supply-chain / prompt loading anomalies** | Scans every loaded prompt template for path traversal in the loader call, Jinja2 SSTI payloads, and unsafe template flags | enabled |
 | **Tool enumeration & misuse signals** | Flags agents that enumerate the full tool list in a single turn, call tools outside the declared `bind_tools(...)` allow-list, or pass tool arguments matching shell-metacharacter / SSRF patterns | enabled |
-| **Memory / context poisoning detection** | On every memory store write, flags entries that look like system-prompt overrides (`you are now`, `ignore previous`), entries that exceed a size threshold and would dominate retrievals, and writes to keys the current agent shouldn't own | enabled |
+| **Memory / context poisoning detection** | Flags memory entries that look like system-prompt overrides, entries that exceed a size threshold and would dominate retrievals, and writes to keys the current agent shouldn't own | enabled |
 | **PII / sensitive data in checkpoints or messages** | Real-time regex scan on node ingress, node egress, and checkpoint blobs: SSN, credit cards, emails, phone numbers, IP addresses, custom patterns | enabled |
-| **Agent goal hijack signals** | Compares the current node's effective system prompt and pending tool calls against the originating user message; flags drift such as the system prompt suddenly mentioning `transfer funds` when the user asked for a recipe | enabled |
-| **Inter-agent / graph communication anomalies** | Flags graph traversals that exceed `recursion_limit` early, edges traversed that aren't in the declared topology, and `Send(...)` payloads to subgraphs the current node didn't declare as targets | enabled |
-| **SQL / metadata injection in checkpoint backends** | Scans `thread_id`, `checkpoint_ns`, and any user-controllable filter strings passed to `SqliteSaver` / `PostgresSaver` for SQL-injection signatures and metadata-key escape sequences | enabled |
+| **Agent goal hijack signals** | Compares the current node's effective system prompt and pending tool calls against the originating user message; flags drift | enabled |
+| **Inter-agent / graph communication anomalies** | Flags graph traversals that exceed `recursion_limit`, edges traversed that aren't in the declared topology, and `Send(...)` payloads to undeclared subgraphs | enabled |
+| **SQL / metadata injection in checkpoint backends** | Scans `thread_id`, `checkpoint_ns`, and any user-controllable filter strings for SQL-injection signatures | enabled |
 | **Structured security events** | Every detection is a JSON event with `correlation_id`, `run_id`, `thread_id`, `node`, timestamp, state hash, and reason | enabled |
 
-Every Tier 1 detector can be tuned via `lens.yaml`, but each one is enabled by default. There is no detector that requires opt-in.
+### Tier 2: Interventions (off by default, opt-in per feature)
+
+| Feature | What it does | Default |
+|---|---|---|
+| **Hard PII redaction** | Replaces matched PII in the state's message list and string fields with `[REDACTED:<type>]` before forwarding to the next node. Mode: `redact` or `block`. | disabled |
+| **Tool allow-list / misuse defense** | Per-graph allow-list of permitted tools + hard block on Tier 1 `shell_metachar` / `ssrf_pattern` / `oversized_args` matches. Mode: `block` (raises `LensBlockedError`) or `log`. | disabled |
+| **Checkpoint integrity protection** | Refuses to load a checkpoint blob containing unsafe pickle opcodes. Optionally HMAC-signs blobs on write and verifies on read. Mode: `enforce` (raises) or `log`. | disabled |
+| **Agent goal / prompt guard** | Turns Tier 1 `system_prompt_drift` / `tool_call_drift` detections into a terminal `block`. Mode: `block` or `log`. | disabled |
+| **Rate limiting on tool calls** | Token-bucket per `tenant \| thread \| tool`, args-size-aware cost. Mode: `throttle` (returns `retry_after`) or `block` (returns 429-equivalent). | disabled |
+| **Circuit breaker for cascading failures** | Auto-opens on upstream error rate; optionally opens preemptively when an attack is in progress. | disabled |
+| **Audit-proof signaling** | Stamps `X-Lens-Triggered`, `X-Lens-Reason`, `X-Lens-Action` headers on every Tier 2 decision, and optionally writes the same fields into `state["__lens__"]` for downstream nodes. | disabled |
+
+Every Tier 2 block in the YAML carries its own `enabled` flag. Turning on one does not turn on any other. Run any new intervention in `log` / `throttle` mode against production traffic before flipping to `block` / `enforce`.
 
 ---
 
@@ -141,23 +141,31 @@ Every detector emits a JSON event when it matches. Events go to the configured d
 {"event": "node_inspected", "run_id": "run-1", "thread_id": "abc-123", "node": "act", "correlation_id": "8f3a...", "state_hash": "sha256:9b1d...", "detections": [{"detector": "goal_hijack", "rule": "system_prompt_drift", "severity": "high"}], "timestamp": 1769420401.3}
 {"event": "checkpoint_inspected", "run_id": "run-1", "thread_id": "abc-123", "checkpoint_id": "01J9...", "correlation_id": "8f3a...", "detections": [{"detector": "checkpoint", "rule": "unsafe_pickle_opcode", "opcode": "REDUCE", "severity": "critical"}], "timestamp": 1769420402.1}
 {"event": "tool_call_inspected", "run_id": "run-1", "thread_id": "abc-123", "tool": "shell", "correlation_id": "8f3a...", "detections": [{"detector": "tool", "rule": "shell_metachar", "match": "; rm -rf", "severity": "high"}], "timestamp": 1769420402.4}
-{"event": "memory_inspected", "run_id": "run-1", "thread_id": "abc-123", "key": "user_pref", "detections": [{"detector": "memory", "rule": "system_prompt_override", "severity": "high"}], "timestamp": 1769420402.6}
 {"event": "attack_surface_scan", "correlation_id": "boot-1769420400", "detections": [{"detector": "attack_surface", "rule": "pickle_checkpoint_backend", "saver": "PostgresSaver", "severity": "high"}], "timestamp": 1769420400.0}
 {"event": "prompt_scan", "correlation_id": "load-1769420400", "prompt_path": "/prompts/system.jinja2", "detections": [{"detector": "supply_chain", "rule": "jinja_ssti", "file": "system.jinja2", "severity": "critical"}], "timestamp": 1769420400.2}
 ```
 
-`correlation_id` is stable across every event from the same run/thread so the chain can be reconstructed. `state_hash` is a SHA-256 of the canonicalised state dict at the moment of inspection — useful for deduping retries and for matching against external audit logs without keeping the state contents themselves.
+`correlation_id` is stable across every event from the same `(run_id, thread_id)` so the chain can be reconstructed. `state_hash` is a SHA-256 of the canonicalised state dict at the moment of inspection — useful for deduping retries and for matching against external audit logs without keeping the state contents themselves.
 
-### Joining events back to a run
+### Inline signaling — Tier 2
 
-Every event carries the LangGraph-native triple `(run_id, thread_id, node)` in addition to the lens-generated `correlation_id`. The triple is what LangSmith and LangGraph Server already log against, so events joined on those fields will line up with any existing dashboards.
+When a Tier 2 intervention fires, the lens also signals to the caller inline:
+
+| Action | Behaviour | Headers set on the decision |
+|---|---|---|
+| `allow` (Tier 1 detection only) | Pass through | `X-Lens-Triggered: true`, `X-Lens-Reason: <detector>.<rule>,...` (if `audit_signaling.enabled`) |
+| `redact` (PII redactor) | `decision.modified_state` is the scrubbed state; caller forwards that instead | `X-Lens-Triggered: true`, `X-Lens-Action: redact`, `X-Lens-Reason: pii_redactor.<type>` |
+| `throttle` (rate limiter) | `decision.retry_after` is set; caller sleeps and retries, or returns it to the user | `X-Lens-Triggered: true`, `X-Lens-Action: throttle`, `Retry-After: <s>` |
+| `block` (allowlist, goal guard, circuit, checkpoint protector, rate limit in `block` mode) | `LensBlockedError` raised through the callback; `decision.status_code` is the HTTP-equivalent | `X-Lens-Triggered: true`, `X-Lens-Action: block`, `X-Lens-Reason: <rule>`, `Retry-After: <s>` (for rate limit / circuit) |
+
+When mounted as a FastAPI middleware in front of LangGraph Server, those headers are stamped onto the outgoing response. When called from a plain Python entry point, the same headers live on `decision.headers` for the caller to use however they want. With `audit_signaling.stamp_state: true`, the same fields are written into `state["__lens__"]` so downstream nodes can read them programmatically without parsing HTTP headers.
 
 ### Limitations
 
-- **The lens does not modify state.** If a `tool/shell_metachar` detection fires, the tool call still runs. The signal goes to logs and metrics; deciding what to do with it is the operator's problem. Tier 2 (planned, separate package) is where blocking lives.
-- **Checkpoint blob scanning is structural, not semantic.** It looks for unsafe pickle opcodes and unknown serializer kinds, not for application-layer secrets buried in legitimately-shaped state. The PII detector catches the latter on a best-effort basis.
-- **Goal-hijack detection is heuristic.** The detector compares the *originating* user message to the current node's effective system prompt and pending tool calls; it will produce false positives when an agent legitimately broadens its scope mid-run. Tune via `goal_hijack.user_intent_similarity_threshold` if your workload is genuinely multi-step.
-- **The callback handler runs synchronously between nodes.** A node that takes 20 seconds will not be interrupted; detections for that node arrive at egress, not mid-execution.
+- **Callbacks observe, they don't rewrite.** Tier 2 `redact` requires `wrap_node(lens, fn)` or a manual `lens.decide_node(...)` call inside the node body; the `LensCallback` alone can't substitute a modified state.
+- **Checkpoint protection is structural.** It refuses unsafe pickle opcodes and (optionally) HMAC-mismatched blobs. It does not validate the *content* of an otherwise-well-formed checkpoint against any schema beyond what Tier 1 already inspects.
+- **Goal-guard is heuristic.** The underlying Tier 1 goal-hijack detector compares the originating user message to the current node's effective system prompt; it will produce false positives when an agent legitimately broadens its scope mid-run. The Tier 2 wrapper only blocks on `system_prompt_drift` and `tool_call_drift` by default — `off_topic_subgoal` (medium severity) is intentionally excluded.
+- **Rate limiting is in-process.** The token bucket lives in the lens instance. In a multi-worker LangGraph Server deployment, each worker has its own bucket. For a shared limiter, run the lens behind a single ingress.
 
 ---
 
@@ -165,7 +173,7 @@ Every event carries the LangGraph-native triple `(run_id, thread_id, node)` in a
 
 ### YAML config
 
-Tier 1 stays at its defaults if you don't override. The example below shows the shape of every block; see `lens.yaml` in the repo for the fully-commented version.
+Tier 1 stays at its defaults if you don't override. Tier 2 stays off if you don't override. The example below shows the shape of every block; see `lens.yaml` in the repo for the fully-commented version.
 
 ```yaml
 # lens.yaml
@@ -183,35 +191,124 @@ sql_injection:   { enabled: true }
 prometheus:      { enabled: true, port: 9092 }
 logging:         { enabled: true, destination: stderr, format: json }
 alerts:          { enabled: false, slack_webhook: "" }
+
+# Tier 2 — interventions (every block defaults to disabled)
+tier2:
+  pii_redaction:
+    enabled: false
+    mode: redact                       # redact | block
+    patterns:
+      - type: ssn
+      - type: credit_card
+      - type: email
+
+  tool_allowlist:
+    enabled: false
+    mode: block                        # block | log
+    allowed_tools: ["search", "calculator"]
+    block_on_rules: ["shell_metachar", "ssrf_pattern", "oversized_args"]
+
+  checkpoint_protector:
+    enabled: false
+    mode: enforce                      # enforce | log
+    block_on_rules: ["unsafe_pickle_opcode"]
+    require_hmac: false
+    signing_key: ""
+
+  goal_guard:
+    enabled: false
+    mode: block                        # block | log
+    block_on_rules: ["system_prompt_drift", "tool_call_drift"]
+
+  rate_limit:
+    enabled: false
+    mode: throttle                     # throttle | block
+    capacity: 60
+    refill_per_second: 1.0
+    key_by_tenant: true
+    key_by_thread: true
+    key_by_tool: false
+
+  circuit_breaker:
+    enabled: false
+    window_seconds: 30
+    min_samples: 20
+    error_rate_threshold: 0.5
+    cooldown_seconds: 30
+    fail_closed_on_attack: false
+
+  audit_signaling:
+    enabled: false
+    stamp_state: false
 ```
 
 ### Inline config
 
 ```python
 from langgraph_lens.config import (
-    LensConfig,
-    CheckpointConfig,
-    PIIConfig, PIIPattern,
-    GoalHijackConfig,
+    LensConfig, Tier2Config,
+    PIIRedactionConfig, PIIPattern,
+    ToolAllowlistConfig,
+    GoalGuardConfig,
 )
 
 config = LensConfig(
-    checkpoint=CheckpointConfig(enabled=True, scan_on_write=True, scan_on_read=True),
-    pii=PIIConfig(
-        enabled=True,
-        scan_ingress=True,
-        scan_egress=True,
-        patterns=[PIIPattern(type="ssn"), PIIPattern(type="email")],
+    tier2=Tier2Config(
+        pii_redaction=PIIRedactionConfig(
+            enabled=True,
+            mode="redact",
+            patterns=[PIIPattern(type="ssn"), PIIPattern(type="email")],
+        ),
+        tool_allowlist=ToolAllowlistConfig(
+            enabled=True,
+            mode="block",
+            allowed_tools=["search", "calculator"],
+        ),
+        goal_guard=GoalGuardConfig(enabled=True, mode="block"),
     ),
-    goal_hijack=GoalHijackConfig(enabled=True, user_intent_similarity_threshold=0.35),
 )
+```
+
+### One-line launches
+
+```bash
+# Zero-config Tier 1 only.
+LANGGRAPH_LENS=1 langgraph dev
+
+# Tier 2 enabled — every flag stays where you put it in lens.yaml.
+LANGGRAPH_LENS=1 LANGGRAPH_LENS_CONFIG=lens.yaml langgraph up --port 2024
+
+# Same lens.yaml for a script-mode agent.
+LANGGRAPH_LENS=1 LANGGRAPH_LENS_CONFIG=lens.yaml python my_agent.py
+```
+
+Python — Tier 2 around a compiled graph:
+
+```python
+from langgraph_lens import Lens, LensCallback, LensConfig, wrap_node, LensBlockedError
+
+lens = Lens(LensConfig.from_yaml("lens.yaml"))
+
+graph.add_node("act", wrap_node(lens, act_node, node="act"))   # for redaction
+app = graph.compile(checkpointer=MemorySaver())
+
+try:
+    result = app.invoke(
+        state,
+        config={
+            "configurable": {"thread_id": "abc-123"},
+            "callbacks": [LensCallback(lens, enforce_blocks=True)],
+        },
+    )
+except LensBlockedError as e:
+    print(f"blocked: {e.decision.reason}", e.decision.headers)
 ```
 
 ---
 
 ## PII patterns
 
-Built-in patterns for common PII types. The same set is used by the node-ingress, node-egress, and checkpoint-scan paths.
+Built-in patterns for common PII types. The same set is used by the Tier 1 detector and the Tier 2 redactor.
 
 | Type | Example match |
 |---|---|
@@ -232,6 +329,8 @@ Built-in patterns for common PII types. The same set is used by the node-ingress
 
 Scrape at `http://localhost:9092/metrics`.
 
+Tier 1:
+
 ```
 langgraph_lens_attack_surface_detections_total{rule="pickle_checkpoint_backend|..."}
 langgraph_lens_checkpoint_detections_total{rule="unsafe_pickle_opcode|schema_drift|..."}
@@ -245,6 +344,15 @@ langgraph_lens_sql_injection_detections_total{rule="union_select|comment_termina
 langgraph_lens_nodes_inspected_total
 langgraph_lens_checkpoints_inspected_total
 langgraph_lens_inspection_duration_seconds{stage="node_ingress|node_egress|checkpoint|tool|memory"}
+```
+
+Tier 2 (stays at zero unless an intervention is enabled):
+
+```
+langgraph_lens_tier2_blocked_total{reason="tool_blocked|rate_limited|goal_hijack|checkpoint_rejected|circuit_open|..."}
+langgraph_lens_tier2_redacted_total{reason="pii_redactor|..."}
+langgraph_lens_tier2_throttled_total{reason="rate_limited"}
+langgraph_lens_circuit_state                     # 0=closed, 1=half_open, 2=open
 ```
 
 **Multiprocess server:** if LangGraph Server forks workers, set `PROMETHEUS_MULTIPROC_DIR` before starting so metrics from all workers are merged:
@@ -269,7 +377,7 @@ otel:
   export_metrics: true
 ```
 
-Each inspected node becomes a span; checkpoint scans become a span event under the parent run span. Correlation IDs propagate as the span's `trace_id`. LangGraph's own `run_id` is attached as a span attribute (`langgraph.run_id`) so spans line up with anything LangSmith already exports.
+Each inspected node becomes a span; checkpoint scans become a span event under the parent run span. Correlation IDs propagate as the span's `trace_id`. Tier 2 decisions appear as span attributes (`langgraph.lens.action`, `langgraph.lens.reason`).
 
 ### Slack / webhook alerts
 
@@ -291,6 +399,8 @@ Alerts default to `supply_chain`, `attack_surface`, and `checkpoint` only. PII a
 
 ## Performance
 
+### Tier 1
+
 Measured on an m7i.2xlarge running LangGraph 0.3.x, a 5-node graph with a `MemorySaver`, payload size p50=4KB. Inspection runs synchronously between nodes.
 
 | Workload | Path | Overhead (p50 latency) | Overhead (throughput) |
@@ -300,7 +410,21 @@ Measured on an m7i.2xlarge running LangGraph 0.3.x, a 5-node graph with a `Memor
 | Streaming `astream_events`, 500 tokens | Callback handler | +1.1 ms / checkpoint | -2.9% |
 | Streaming `astream_events`, 500 tokens | Direct `Lens.inspect_node` | +0.9 ms / checkpoint | -2.2% |
 
-Checkpoint scanning dominates the cost on graphs that checkpoint after every node. Setting `checkpoint.scan_on_read: false` cuts overhead roughly in half on resumed threads, at the cost of not catching pre-existing unsafe-pickle blobs at resume time.
+### Performance impact (Tier 2)
+
+Tier 2 adds measurable overhead — that is the trade you make for hard controls. Numbers are for the same m7i.2xlarge / LangGraph 0.3.x / 5-node graph setup with Tier 2 enabled per row.
+
+| Tier 2 features enabled | Overhead (p50 latency) | Overhead (throughput) |
+|---|---|---|
+| `tool_allowlist` only | +0.2 ms / tool call | -0.7% |
+| `rate_limit` only | +0.1 ms / tool call | -0.4% |
+| `checkpoint_protector` (no HMAC) | +0.3 ms / checkpoint | -1.1% |
+| `checkpoint_protector` + `require_hmac` | +0.6 ms / checkpoint | -2.4% |
+| `goal_guard` | +0.4 ms / node | -1.6% |
+| `pii_redaction` | +1.4 ms / node | -5.3% |
+| All Tier 2 enabled | +1.9 ms / node, +0.7 ms / tool call | -7.1% |
+
+`pii_redaction` is the most expensive Tier 2 feature: it has to walk the message list, run every configured pattern, and re-serialise the modified state. `tool_allowlist`, `rate_limit`, and `circuit_breaker` are essentially free at this scale. `audit_signaling` is not on this table because its cost is unmeasurable.
 
 ---
 
@@ -329,7 +453,7 @@ langgraph-lens version
 
 ## Maintenance and compatibility
 
-This is a v0.1.0 release targeting LangGraph 0.2.x and 0.3.x. LangGraph's callback handler interface and checkpoint serialiser are still pre-1.0 and shift between minor versions. This project tracks the `BaseCallbackHandler` ABI documented for 0.2.50+; compatibility with later versions is untested and not guaranteed.
+This is a v0.2.0 release targeting LangGraph 0.2.x and 0.3.x. LangGraph's callback handler interface and checkpoint serialiser are still pre-1.0 and shift between minor versions. This project tracks the `BaseCallbackHandler` ABI documented for 0.2.50+; compatibility with later versions is untested and not guaranteed.
 
 If you find it works on a newer version, PRs and issue reports are welcome. If you find it breaks, open an issue with the LangGraph version and error — but fixes depend on available time.
 
@@ -348,10 +472,12 @@ ruff check src/
 mypy src/langgraph_lens/
 ```
 
-Tests covering every detector rule:
+Tests covering every detector rule and every Tier 2 intervention:
 
-- **Tier 1 detectors** (`tests/test_checkpoint.py`, `test_supply_chain.py`, `test_tool.py`, `test_memory.py`, `test_pii.py`, `test_goal_hijack.py`, `test_comms.py`, `test_sql_injection.py`) — every rule has at least one positive test, most have explicit negative controls. The checkpoint suite exercises real JSON-Plus blobs and msgpack frames generated at test time; the supply-chain suite includes a known-bad Jinja2 SSTI fixture.
+- **Tier 1 detectors** (`tests/test_checkpoint.py`, `test_supply_chain.py`, `test_tool.py`, `test_memory.py`, `test_pii.py`, `test_goal_hijack.py`, `test_comms.py`, `test_sql_injection.py`) — every rule has at least one positive test, most have explicit negative controls. The checkpoint suite exercises real JSON-Plus blobs and pickle frames generated at test time; the supply-chain suite includes a known-bad Jinja2 SSTI fixture.
 - **Lens orchestrator** (`tests/test_lens.py`, `test_config.py`) — correlation IDs, state hashing, YAML roundtrip, defaults invariant, callback-handler wiring against a stub `StateGraph`.
+- **Tier 2 interventions** (`tests/interventions/`) — every intervention covers both `block`/`log` (or `redact`/`throttle`) modes plus the disabled-passthrough case. PII redactor verifies multi-pattern messages and the deep-copy property (the caller's state is never mutated).
+- **Decision composition** (`tests/test_decide.py`) — the orchestration path through `Lens.decide_node` / `decide_tool_call` / `decide_checkpoint`: short-circuit on block, header merging, audit-headers-absent-when-nothing-fires, and the fail-closed-on-attack circuit-breaker path.
 
 ---
 

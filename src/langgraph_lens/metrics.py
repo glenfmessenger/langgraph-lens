@@ -9,7 +9,7 @@ from __future__ import annotations
 import contextlib
 import os
 
-from prometheus_client import Counter, Histogram, start_http_server
+from prometheus_client import Counter, Gauge, Histogram, start_http_server
 
 from .events import Detection
 
@@ -70,6 +70,27 @@ INSPECTION_DURATION = Histogram(
     "langgraph_lens_inspection_duration_seconds",
     "Wall-clock cost of one inspection pass.",
     ["stage"],
+)
+
+# Tier 2 counters. Stay at zero unless an intervention is enabled.
+TIER2_BLOCKED = Counter(
+    "langgraph_lens_tier2_blocked_total",
+    "Calls terminated by a Tier 2 intervention.",
+    ["reason"],
+)
+TIER2_REDACTED = Counter(
+    "langgraph_lens_tier2_redacted_total",
+    "Calls forwarded with a Tier 2-modified state.",
+    ["reason"],
+)
+TIER2_THROTTLED = Counter(
+    "langgraph_lens_tier2_throttled_total",
+    "Calls throttled by the Tier 2 rate limiter.",
+    ["reason"],
+)
+CIRCUIT_STATE = Gauge(
+    "langgraph_lens_circuit_state",
+    "Circuit-breaker state — 0=closed, 1=half_open, 2=open.",
 )
 
 

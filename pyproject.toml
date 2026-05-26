@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "langgraph-lens"
-version = "0.1.0"
+version = "0.2.0"
 description = "Zero-config runtime observability for LangGraph agents: checkpoint, prompt-supply-chain, tool, memory, PII, goal-hijack, inter-agent, and SQL-injection detectors emitted as structured events."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -46,6 +46,10 @@ dev = [
     "ruff>=0.4.0",
     "mypy>=1.10",
     "types-PyYAML",
+    # langchain-core is needed at type-check time so the BaseCallbackHandler
+    # import in middleware.py resolves and LensCallback isn't seen as
+    # subclassing Any. Runtime users who don't use callbacks don't need it.
+    "langchain-core>=0.3.0",
 ]
 
 [project.scripts]

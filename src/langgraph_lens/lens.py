@@ -34,10 +34,24 @@ from .events import (
     new_correlation_id,
     write_event,
 )
+from .interventions import (
+    AuditSignalingIntervention,
+    CheckpointProtectorIntervention,
+    CircuitBreakerIntervention,
+    GoalGuardIntervention,
+    LensDecision,
+    PIIRedactorIntervention,
+    RateLimiterIntervention,
+    ToolAllowlistIntervention,
+)
 from .metrics import (
     CHECKPOINTS_INSPECTED,
+    CIRCUIT_STATE,
     INSPECTION_DURATION,
     NODES_INSPECTED,
+    TIER2_BLOCKED,
+    TIER2_REDACTED,
+    TIER2_THROTTLED,
     maybe_start_server,
     record_detection,
 )
@@ -68,6 +82,23 @@ class Lens:
         self.attack_surface = AttackSurfaceDetector(self.config.attack_surface)
         self.alerts = AlertSender(self.config.alerts)
         self.otel = OtelBridge(self.config.otel)
+
+        # Tier 2 interventions. Each one is a no-op until its config
+        # block has `enabled: true`.
+        t2 = self.config.tier2
+        self.pii_redactor = PIIRedactorIntervention(t2.pii_redaction)
+        self.tool_allowlist = ToolAllowlistIntervention(
+            t2.tool_allowlist, t1_detector=self.tool
+        )
+        self.checkpoint_protector = CheckpointProtectorIntervention(
+            t2.checkpoint_protector, t1_detector=self.checkpoint
+        )
+        self.goal_guard = GoalGuardIntervention(
+            t2.goal_guard, t1_detector=self.goal_hijack
+        )
+        self.rate_limiter = RateLimiterIntervention(t2.rate_limit)
+        self.circuit_breaker = CircuitBreakerIntervention(t2.circuit_breaker)
+        self.audit = AuditSignalingIntervention(t2.audit_signaling)
 
         # Correlation IDs are stable per (run_id, thread_id) pair so that
         # every event from one invocation joins on a single id.
@@ -312,6 +343,165 @@ class Lens:
         self._emit(event)
         return event
 
+    # -- Tier 2 decision paths --------------------------------------------
+
+    def decide_node(
+        self,
+        *,
+        node: str,
+        state: dict[str, Any],
+        run_id: str | None = None,
+        thread_id: str | None = None,
+        declared_edges: list[tuple[str, str]] | None = None,
+        recursion_limit: int | None = None,
+        recursion_depth: int | None = None,
+    ) -> tuple[LensDecision, Event]:
+        """Run Tier 1 inspection *and* Tier 2 interventions on a node.
+
+        Always runs every detector — Tier 2 interventions are layered on
+        top and may modify the state or terminate the call. The returned
+        Event reflects the combined detections; the LensDecision tells
+        the caller what to do.
+        """
+        decision = LensDecision()
+        extra_detections: list[Detection] = []
+
+        # 1. Circuit breaker.
+        cb_decision, cb_dets = self.circuit_breaker.evaluate_request()
+        extra_detections.extend(cb_dets)
+        decision = decision.merge(cb_decision)
+
+        # 2. Goal guard.
+        if not decision.is_terminal and thread_id:
+            gg_decision, gg_dets = self.goal_guard.evaluate(
+                state=state,
+                originating_intent=self._thread_user_intent.get(thread_id),
+            )
+            extra_detections.extend(gg_dets)
+            decision = decision.merge(gg_decision)
+            for d in gg_dets:
+                self.circuit_breaker.record_attack_signal(d.severity)
+
+        # 3. PII redactor (last — may rewrite state for downstream).
+        if not decision.is_terminal:
+            pr_decision, pr_dets = self.pii_redactor.evaluate(state)
+            extra_detections.extend(pr_dets)
+            decision = decision.merge(pr_decision)
+
+        # Run Tier 1 inspection against the state the caller will
+        # actually forward (the redacted one if PII redactor fired).
+        state_for_inspection = decision.modified_state or state
+        event = self.inspect_node(
+            node=node,
+            state=state_for_inspection,
+            run_id=run_id,
+            thread_id=thread_id,
+            declared_edges=declared_edges,
+            recursion_limit=recursion_limit,
+            recursion_depth=recursion_depth,
+        )
+        if extra_detections:
+            event.detections.extend(extra_detections)
+            for d in extra_detections:
+                record_detection(d)
+
+        self._record_tier2_outcome(decision)
+        if self.config.tier2.audit_signaling.stamp_state and isinstance(
+            state_for_inspection, dict
+        ):
+            self.audit.stamp_state(state_for_inspection, decision)
+        return self.audit.stamp(decision), event
+
+    def decide_tool_call(
+        self,
+        *,
+        tool: str,
+        args: dict[str, Any] | str,
+        run_id: str | None = None,
+        thread_id: str | None = None,
+        tenant: str | None = None,
+    ) -> tuple[LensDecision, Event]:
+        decision = LensDecision()
+        extra_detections: list[Detection] = []
+
+        cb_decision, cb_dets = self.circuit_breaker.evaluate_request()
+        extra_detections.extend(cb_dets)
+        decision = decision.merge(cb_decision)
+
+        if not decision.is_terminal:
+            ta_decision, ta_dets = self.tool_allowlist.evaluate(
+                tool=tool, args=args, thread_id=thread_id
+            )
+            extra_detections.extend(ta_dets)
+            decision = decision.merge(ta_decision)
+            for d in ta_dets:
+                self.circuit_breaker.record_attack_signal(d.severity)
+
+        if not decision.is_terminal:
+            rl_decision, rl_dets = self.rate_limiter.evaluate(
+                tool=tool, args=args, thread_id=thread_id, tenant=tenant
+            )
+            extra_detections.extend(rl_dets)
+            decision = decision.merge(rl_decision)
+
+        event = self.inspect_tool_call(
+            tool=tool, args=args, run_id=run_id, thread_id=thread_id
+        )
+        if extra_detections:
+            event.detections.extend(extra_detections)
+            for d in extra_detections:
+                record_detection(d)
+
+        self._record_tier2_outcome(decision)
+        return self.audit.stamp(decision), event
+
+    def decide_checkpoint(
+        self,
+        *,
+        blob: bytes | dict[str, Any],
+        metadata: dict[str, Any] | None = None,
+        run_id: str | None = None,
+        thread_id: str | None = None,
+        checkpoint_id: str | None = None,
+        direction: str = "write",
+    ) -> tuple[LensDecision, Event]:
+        decision = LensDecision()
+        extra_detections: list[Detection] = []
+
+        cp_decision, cp_dets = self.checkpoint_protector.evaluate(
+            blob=blob, metadata=metadata, direction=direction, thread_id=thread_id
+        )
+        extra_detections.extend(cp_dets)
+        decision = decision.merge(cp_decision)
+        for d in cp_dets:
+            self.circuit_breaker.record_attack_signal(d.severity)
+
+        event = self.inspect_checkpoint(
+            blob=blob,
+            metadata=metadata,
+            run_id=run_id,
+            thread_id=thread_id,
+            checkpoint_id=checkpoint_id,
+            direction=direction,
+        )
+        if extra_detections:
+            event.detections.extend(extra_detections)
+            for d in extra_detections:
+                record_detection(d)
+
+        self._record_tier2_outcome(decision)
+        return self.audit.stamp(decision), event
+
+    def record_upstream_result(self, *, error: bool) -> None:
+        """Feed an upstream success/error into the circuit breaker.
+
+        Call this after `graph.invoke(...)` (or any external dependency
+        the lens guards) returns or raises. With no Tier 2 interventions
+        enabled this is a no-op.
+        """
+        self.circuit_breaker.record_response(error=error)
+        CIRCUIT_STATE.set(self.circuit_breaker.state_value)
+
     # -- API for tests / dashboards ---------------------------------------
 
     def events_for_thread(self, thread_id: str) -> list[Event]:
@@ -328,6 +518,16 @@ class Lens:
             cid = new_correlation_id()
             self._correlation_pairs[key] = cid
         return cid
+
+    def _record_tier2_outcome(self, decision: LensDecision) -> None:
+        if decision.action == "block":
+            TIER2_BLOCKED.labels(reason=decision.reason or "unknown").inc()
+        elif decision.action == "redact":
+            reasons = sorted({t.split(".", 1)[0] for t in decision.triggered_by})
+            TIER2_REDACTED.labels(reason=",".join(reasons) or "unknown").inc()
+        elif decision.action == "throttle":
+            TIER2_THROTTLED.labels(reason=decision.reason or "unknown").inc()
+        CIRCUIT_STATE.set(self.circuit_breaker.state_value)
 
     def _emit(self, event: Event) -> None:
         for d in event.detections:
