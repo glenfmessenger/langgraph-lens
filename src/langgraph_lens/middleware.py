@@ -130,6 +130,14 @@ class LensCallback(BaseCallbackHandler):
         metadata: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
+        # LangChain dispatches `on_chain_start` for the outer graph
+        # wrapper, every real LangGraph node, and any internal
+        # Runnable transforms. Inspecting all of them gives 12 events
+        # for a 5-node graph; inspecting only real graph nodes gives 5.
+        # Filter to real nodes by requiring the `langgraph_node` key
+        # LangGraph sets in metadata for compiled graph nodes.
+        if not metadata or "langgraph_node" not in metadata:
+            return
         self._safe(
             lambda: self.lens.inspect_node(
                 node=_node_name(serialized, kwargs, metadata),
@@ -150,10 +158,16 @@ class LensCallback(BaseCallbackHandler):
         tags: list[str] | None = None,
         **kwargs: Any,
     ) -> None:
+        # Only emit the egress PII scan once, at the outer run boundary
+        # (parent_run_id is None means this is the top-level chain
+        # ending). Per-node `<exit>` events doubled the callback cost
+        # without adding new signal — the node's ingress event already
+        # captures the state on its way in, and the final-state PII
+        # scan catches anything the agent emitted along the way.
+        if parent_run_id is not None:
+            return
         if not isinstance(outputs, dict) or not self.lens.config.pii.scan_egress:
             return
-        # Egress PII scan; piggy-backs on `inspect_node` with the node
-        # marked as "<exit>" so the event stays joinable.
         self._safe(
             lambda: self.lens.inspect_node(
                 node="<exit>",

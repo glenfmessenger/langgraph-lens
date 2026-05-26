@@ -94,7 +94,7 @@ def _build_graph(
             fn = _node
         g.add_node(n, fn)
     g.set_entry_point(names[0])
-    for a, b in zip(names, names[1:], strict=True):
+    for a, b in zip(names, names[1:], strict=False):
         g.add_edge(a, b)
     g.add_edge(names[-1], END)
     return g.compile(checkpointer=MemorySaver())
