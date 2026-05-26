@@ -399,32 +399,55 @@ Alerts default to `supply_chain`, `attack_surface`, and `checkpoint` only. PII a
 
 ## Performance
 
-### Tier 1
+All numbers below are measured by `bench/bench.py` — no estimates. To reproduce, run:
 
-Measured on an m7i.2xlarge running LangGraph 0.3.x, a 5-node graph with a `MemorySaver`, payload size p50=4KB. Inspection runs synchronously between nodes.
+```bash
+pip install -e ".[dev]"
+python bench/bench.py --markdown
+```
 
-| Workload | Path | Overhead (p50 latency) | Overhead (throughput) |
+**Test rig:** Apple M2 (8 cores), 8 GiB RAM, macOS 26.5, Python 3.13.7, LangGraph 1.2.1, LangChain Core 1.4.0. 2000 iterations per row, 200-iteration warm-up, GC disabled inside the timed loop. Single-threaded. Local laptop, not a production-class box — your absolute numbers will differ, but the *relative* costs (callback vs direct, with/without each Tier 2 feature) should be representative.
+
+### Whole-graph invoke — 5-node graph, ~4 KB state
+
+One full `app.invoke(...)` on a `StateGraph` with five sequential nodes and a `MemorySaver`. Baseline is the same graph with no lens at all.
+
+| Configuration | p50 latency | Overhead (p50) | Throughput drop |
 |---|---|---|---|
-| Sequential 5-node graph, 4KB state | Callback handler | +0.8 ms / node | -2.1% |
-| Sequential 5-node graph, 4KB state | Direct `Lens.inspect_node` | +0.6 ms / node | -1.5% |
-| Streaming `astream_events`, 500 tokens | Callback handler | +1.1 ms / checkpoint | -2.9% |
-| Streaming `astream_events`, 500 tokens | Direct `Lens.inspect_node` | +0.9 ms / checkpoint | -2.2% |
+| baseline (no lens) | 1.36 ms | — | — |
+| Tier 1 — callback handler | 1.94 ms | +0.58 ms | +29.1% |
+| Tier 1 — direct `Lens.inspect_node` in each node | 1.60 ms | +0.24 ms | +14.4% |
+| Tier 2 — `audit_signaling` only | 1.57 ms | +0.21 ms | +11.7% |
+| Tier 2 — `goal_guard` | 1.55 ms | +0.19 ms | +10.6% |
+| Tier 2 — `pii_redaction` | 2.26 ms | +0.90 ms | +38.7% |
+| Tier 2 — all node-path features (`audit + goal + pii + circuit`) | 2.27 ms | +0.91 ms | +38.9% |
 
-### Performance impact (Tier 2)
+The callback path is more expensive than direct inspection because LangChain's callback manager spins up a `RunManager` per node and dispatches by event type — the lens itself is the same code in both cases. If you're latency-sensitive and don't need the global `LANGGRAPH_LENS=1` install, calling `lens.inspect_node(...)` from inside each node body is roughly 2× cheaper.
 
-Tier 2 adds measurable overhead — that is the trade you make for hard controls. Numbers are for the same m7i.2xlarge / LangGraph 0.3.x / 5-node graph setup with Tier 2 enabled per row.
+`pii_redaction` is the most expensive Tier 2 feature on the node path: it deep-copies the state, walks the message list, runs every configured pattern, and re-serialises the modified copy. If you don't need redaction, leaving it off is the single biggest perf win.
 
-| Tier 2 features enabled | Overhead (p50 latency) | Overhead (throughput) |
-|---|---|---|
-| `tool_allowlist` only | +0.2 ms / tool call | -0.7% |
-| `rate_limit` only | +0.1 ms / tool call | -0.4% |
-| `checkpoint_protector` (no HMAC) | +0.3 ms / checkpoint | -1.1% |
-| `checkpoint_protector` + `require_hmac` | +0.6 ms / checkpoint | -2.4% |
-| `goal_guard` | +0.4 ms / node | -1.6% |
-| `pii_redaction` | +1.4 ms / node | -5.3% |
-| All Tier 2 enabled | +1.9 ms / node, +0.7 ms / tool call | -7.1% |
+### Standalone Tier 1 / Tier 2 cost — single tool call
 
-`pii_redaction` is the most expensive Tier 2 feature: it has to walk the message list, run every configured pattern, and re-serialise the modified state. `tool_allowlist`, `rate_limit`, and `circuit_breaker` are essentially free at this scale. `audit_signaling` is not on this table because its cost is unmeasurable.
+These rows are the absolute cost of one `lens.inspect_tool_call(...)` or `lens.decide_tool_call(...)`. There is no meaningful "baseline" — a tool call without the lens is a no-op — so latencies are reported in microseconds rather than as a percentage delta.
+
+| Configuration | p50 latency / call |
+|---|---|
+| Tier 1 — `inspect_tool_call` | 21.5 µs |
+| Tier 2 — `tool_allowlist` (via `decide_tool_call`) | 77.5 µs |
+| Tier 2 — `rate_limit` (via `decide_tool_call`) | 26.2 µs |
+| Tier 2 — all tool-path features (`allowlist + rate_limit + circuit + audit`) | 80.6 µs |
+
+`tool_allowlist` is the most expensive tool-path intervention because it re-runs the entire Tier 1 misuse-detection set (shell-metachar, SSRF, oversized args) against the args. `rate_limit` is essentially free.
+
+### Standalone Tier 1 / Tier 2 cost — single checkpoint
+
+A 60-byte JSON checkpoint blob (no pickle, no large state). The cost scales with blob size for the opcode scan; this is the floor.
+
+| Configuration | p50 latency / checkpoint |
+|---|---|
+| Tier 1 — `inspect_checkpoint` | 3.4 µs |
+| Tier 2 — `checkpoint_protector` | 5.3 µs |
+| Tier 2 — `checkpoint_protector + require_hmac` | 6.8 µs |
 
 ---
 
@@ -446,16 +469,15 @@ langgraph-lens version
 
 ## Requirements
 
-- Python ≥ 3.10
-- LangGraph ≥ 0.2.50 (for the `BaseCallbackHandler` integration path)
-- LangChain Core ≥ 0.3.0 (transitive dependency, for prompt scanning)
-- Optional: `langgraph-checkpoint-postgres` or `langgraph-checkpoint-sqlite` if you want the SQL-injection detector wired into the actual saver call
+- Python ≥ 3.10 (tested locally on 3.13; CI runs 3.10 / 3.11 / 3.12)
+- LangGraph ≥ 0.2.50 declared as the minimum, but verified against LangGraph 1.2.1 + LangChain Core 1.4.0 only. Older versions may work — the `BaseCallbackHandler` interface has been stable since 0.2.50 — but are untested.
+- Optional: `langgraph-checkpoint-postgres` or `langgraph-checkpoint-sqlite` if you want the SQL-injection detector wired into the actual saver call. The detector is unit-tested against synthetic metadata; the real-saver path is not tested.
 
 ## Maintenance and compatibility
 
-This is a v0.2.0 release targeting LangGraph 0.2.x and 0.3.x. LangGraph's callback handler interface and checkpoint serialiser are still pre-1.0 and shift between minor versions. This project tracks the `BaseCallbackHandler` ABI documented for 0.2.50+; compatibility with later versions is untested and not guaranteed.
+This is a v0.2.0 release. The end-to-end paths verified are: the global `LANGGRAPH_LENS=1` callback install on LangChain Core 1.4.0, the per-graph `LensCallback(lens)` attachment, and the `wrap_node(lens, fn)` redaction helper against a compiled `StateGraph` + `MemorySaver`. The Postgres/SQLite/Redis savers, LangGraph Server (`langgraph dev`, `langgraph up`), and multi-worker deployments are not exercised in CI or the benchmark.
 
-If you find it works on a newer version, PRs and issue reports are welcome. If you find it breaks, open an issue with the LangGraph version and error — but fixes depend on available time.
+If you find it works on other versions, PRs and issue reports are welcome. If you find it breaks, open an issue with the LangGraph version and error — but fixes depend on available time.
 
 ---
 
@@ -472,12 +494,13 @@ ruff check src/
 mypy src/langgraph_lens/
 ```
 
-Tests covering every detector rule and every Tier 2 intervention:
+68 pytest cases in total. Coverage is *uneven across rules* — every detector has at least one positive test, but not every rule within a detector does. The honest breakdown:
 
-- **Tier 1 detectors** (`tests/test_checkpoint.py`, `test_supply_chain.py`, `test_tool.py`, `test_memory.py`, `test_pii.py`, `test_goal_hijack.py`, `test_comms.py`, `test_sql_injection.py`) — every rule has at least one positive test, most have explicit negative controls. The checkpoint suite exercises real JSON-Plus blobs and pickle frames generated at test time; the supply-chain suite includes a known-bad Jinja2 SSTI fixture.
-- **Lens orchestrator** (`tests/test_lens.py`, `test_config.py`) — correlation IDs, state hashing, YAML roundtrip, defaults invariant, callback-handler wiring against a stub `StateGraph`.
-- **Tier 2 interventions** (`tests/interventions/`) — every intervention covers both `block`/`log` (or `redact`/`throttle`) modes plus the disabled-passthrough case. PII redactor verifies multi-pattern messages and the deep-copy property (the caller's state is never mutated).
-- **Decision composition** (`tests/test_decide.py`) — the orchestration path through `Lens.decide_node` / `decide_tool_call` / `decide_checkpoint`: short-circuit on block, header merging, audit-headers-absent-when-nothing-fires, and the fail-closed-on-attack circuit-breaker path.
+- **Tier 1 detectors** — every detector module has positive tests for its most-load-bearing rules. Some lower-severity or harder-to-trigger rules (e.g. `unsafe_chat_template`, `unsigned_hub_pull`, `oversized_blob`, `unknown_serializer_kind`, `off_topic_subgoal`, `tool_call_drift`, `send_to_undeclared_target`, `oversized_state_growth`, three of four SQL-injection rules) ship without an explicit positive test. They're exercised through the static rule list in the detector code, but a contribution adding direct tests is welcome.
+- **Lens orchestrator** (`tests/test_lens.py`, `test_config.py`) — correlation IDs, state hashing, YAML roundtrip, defaults invariant.
+- **Tier 2 interventions** (`tests/interventions/`) — every intervention has positive tests for both modes (`block`/`log` or `redact`/`throttle`) and the disabled-passthrough case. The PII redactor specifically verifies multi-pattern messages and the deep-copy property (caller's state is not mutated). The checkpoint protector exercises the HMAC sign/verify roundtrip plus the mismatched-HMAC block path.
+- **Decision composition** (`tests/test_decide.py`) — the orchestration path through `Lens.decide_node` / `decide_tool_call` / `decide_checkpoint`: short-circuit on block, header merging, audit-headers-absent-when-nothing-fires, `wrap_node` redaction round-trip, `wrap_node` raising `LensBlockedError`, and the attack-signal feed into the circuit breaker.
+- **Real-graph end-to-end** — `bench/bench.py` builds an actual compiled `StateGraph` with `MemorySaver` and exercises the callback path, the direct `inspect_node` path, and the `wrap_node` redaction path for every Tier 2 feature. It runs ~6.8 k iterations of `app.invoke(...)` per full benchmark pass.
 
 ---
 

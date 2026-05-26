@@ -48,8 +48,11 @@ dev = [
     "types-PyYAML",
     # langchain-core is needed at type-check time so the BaseCallbackHandler
     # import in middleware.py resolves and LensCallback isn't seen as
-    # subclassing Any. Runtime users who don't use callbacks don't need it.
+    # subclassing Any. langgraph is needed by the benchmark and the
+    # end-to-end examples. Runtime users who don't use callbacks don't
+    # need either.
     "langchain-core>=0.3.0",
+    "langgraph>=0.2.50",
 ]
 
 [project.scripts]
