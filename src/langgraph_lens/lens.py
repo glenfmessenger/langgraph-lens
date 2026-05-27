@@ -7,6 +7,7 @@ per-graph `LensCallback(lens)` delegate to the same instance.
 
 from __future__ import annotations
 
+import os
 import time
 from collections import defaultdict, deque
 from pathlib import Path
@@ -111,9 +112,59 @@ class Lens:
         self._thread_user_intent: dict[str, str] = {}
         # Per-thread initial state size, used by the comms detector.
         self._thread_initial_state_size: dict[str, int] = {}
+        # Cached declared edges per compiled graph (attached via
+        # `lens.attach_graph(...)`). The callback handler / wrap_node
+        # passes the active graph reference at runtime so the comms
+        # detector's `undeclared_edge` rule can fire.
+        self._declared_edges: list[tuple[str, str]] | None = None
+        # Has the once-per-process attack-surface scan run yet?
+        self._attack_surface_scanned = False
 
         if self.config.prometheus.enabled:
-            maybe_start_server(self.config.prometheus.port)
+            maybe_start_server(
+                self.config.prometheus.port,
+                bind_address=self.config.prometheus.bind_address,
+            )
+
+    # -- graph attachment + boot-time auto-scans --------------------------
+
+    def attach_graph(self, compiled_graph: Any) -> None:
+        """Register a compiled `StateGraph` so the comms detector can
+        compare runtime traversal against its declared topology.
+
+        Safe to call multiple times — last attachment wins. Best-effort:
+        if the graph object doesn't expose its edges in a recognised
+        shape, the call no-ops.
+        """
+        from .integrations.topology import extract_topology
+
+        edges = extract_topology(compiled_graph)
+        if edges:
+            self._declared_edges = edges
+
+    def _maybe_auto_scan_attack_surface(self) -> None:
+        """Run a once-per-process attack-surface scan with whatever
+        runtime info we can infer from the environment. Triggered on
+        the first node inspection so the event lines up with a real
+        run rather than appearing at import time before the graph
+        even exists.
+        """
+        if self._attack_surface_scanned:
+            return
+        self._attack_surface_scanned = True
+        try:
+            from .detectors.attack_surface import RuntimeInfo
+
+            info = RuntimeInfo(
+                server_mode=bool(os.environ.get("LANGGRAPH_SERVER")),
+                server_auth_configured=bool(
+                    os.environ.get("LANGGRAPH_AUTH")
+                    or os.environ.get("LANGGRAPH_API_KEY")
+                ),
+            )
+            self.scan_attack_surface(info)
+        except Exception:  # noqa: BLE001 -- never raise at runtime
+            pass
 
     # -- node inspection ---------------------------------------------------
 
@@ -133,6 +184,12 @@ class Lens:
         correlation_id = self._correlation_for(run_id, thread_id)
         detections: list[Detection] = []
 
+        # Once-per-process boot scans: attack-surface scan with whatever
+        # we can infer from the environment. Fires on the first node
+        # inspection so it aligns with a real run rather than a stale
+        # import-time event.
+        self._maybe_auto_scan_attack_surface()
+
         # Capture originating user intent on first node, for goal-hijack.
         if thread_id and thread_id not in self._thread_user_intent:
             intent = _extract_user_intent(state)
@@ -140,6 +197,13 @@ class Lens:
                 self._thread_user_intent[thread_id] = intent
         if thread_id and thread_id not in self._thread_initial_state_size:
             self._thread_initial_state_size[thread_id] = _state_size(state)
+
+        # Fall back to the lens-attached topology if the caller didn't
+        # pass declared_edges explicitly. This is what makes the comms
+        # detector's `undeclared_edge` rule fire under the zero-config
+        # callback path.
+        if declared_edges is None and self._declared_edges is not None:
+            declared_edges = self._declared_edges
 
         # PII at node ingress.
         if self.config.pii.scan_ingress:

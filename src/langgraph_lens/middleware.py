@@ -68,6 +68,22 @@ def install_global_callback(config: LensConfig) -> Lens:
     lens = Lens(config)
     _GLOBAL_LENS = lens
 
+    # Auto-install integrations the BaseCallbackHandler can't reach.
+    # Saver and store auto-protection mean any user code that does
+    # `graph.compile(checkpointer=PostgresSaver(...))` gets
+    # checkpoint inspection without changing a line. Best-effort —
+    # silently no-ops if langgraph isn't installed.
+    try:
+        from .integrations import (
+            install_saver_auto_protection,
+            install_store_auto_protection,
+        )
+
+        install_saver_auto_protection(lens)
+        install_store_auto_protection(lens)
+    except Exception:  # noqa: BLE001 -- never raise at import time
+        traceback.print_exc(file=sys.stderr)
+
     if not _LANGCHAIN_AVAILABLE:
         # Still useful — direct `lens.inspect_*` calls work without
         # langchain installed. The callback just won't auto-fire.
@@ -227,14 +243,26 @@ class LensCallback(BaseCallbackHandler):
         run_id: Any = None,
         **kwargs: Any,
     ) -> None:
+        joined = "\n".join(prompts)
+        thread_id = _thread_id_from(kwargs.get("metadata"), kwargs)
+        # Auto-scan the rendered prompt for supply-chain signatures —
+        # any Jinja2 SSTI shape that survived template rendering shows
+        # up here. This is the only zero-config path that fires
+        # supply_chain detections in the runtime; manual scan_prompt()
+        # covers static file inspection.
+        self._safe(
+            lambda: self._scan_rendered_prompt(
+                joined, run_id=_stringify(run_id), thread_id=thread_id
+            )
+        )
         # Cheap entry point for the supply-chain detector — flags
         # SSTI-shaped substrings that survived into the rendered prompt.
         self._safe(
             lambda: self.lens.inspect_node(
                 node="<llm>",
-                state={"prompt": "\n".join(prompts)},
+                state={"prompt": joined},
                 run_id=_stringify(run_id),
-                thread_id=_thread_id_from(kwargs.get("metadata"), kwargs),
+                thread_id=thread_id,
             )
         )
 
@@ -242,6 +270,32 @@ class LensCallback(BaseCallbackHandler):
 
     def set_tool_allowlist(self, tools: list[str]) -> None:
         self._tool_allowlist = list(tools)
+
+    def _scan_rendered_prompt(
+        self,
+        prompt_text: str,
+        *,
+        run_id: str | None,
+        thread_id: str | None,
+    ) -> None:
+        """Emit a prompt_scan event if the rendered prompt contains
+        supply-chain signatures (Jinja2 SSTI, etc.).
+        """
+        detections = self.lens.supply_chain.scan_text(
+            prompt_text, filename="<rendered-prompt>"
+        )
+        if not detections:
+            return
+        from .events import Event, EventKind, new_correlation_id
+
+        event = Event(
+            event=EventKind.PROMPT_SCAN,
+            correlation_id=new_correlation_id(prefix="llm-"),
+            run_id=run_id,
+            thread_id=thread_id,
+            detections=detections,
+        )
+        self.lens._emit(event)
 
     @staticmethod
     def _safe(fn: Any) -> None:

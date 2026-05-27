@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class AttackSurfaceConfig(BaseModel):
@@ -176,6 +176,12 @@ class SQLInjectionConfig(BaseModel):
 class PrometheusConfig(BaseModel):
     enabled: bool = True
     port: int = 9092
+    # Default to loopback. The Prometheus exporter exposes per-thread
+    # detection counts and tool-call labels — readable by anyone who
+    # can reach the port. If you want to scrape from another host,
+    # set `bind_address: 0.0.0.0` explicitly and put the port behind
+    # a reverse proxy or your scraper's network ACL.
+    bind_address: str = "127.0.0.1"
 
 
 class LoggingConfig(BaseModel):
@@ -247,6 +253,16 @@ class CheckpointProtectorConfig(BaseModel):
     )
     require_hmac: bool = False
     signing_key: str = ""
+
+    @model_validator(mode="after")
+    def _hmac_requires_key(self) -> CheckpointProtectorConfig:
+        if self.require_hmac and not self.signing_key:
+            raise ValueError(
+                "checkpoint_protector.require_hmac is true but signing_key is empty. "
+                "Set a non-empty signing_key (e.g. from an env var) or set "
+                "require_hmac to false."
+            )
+        return self
 
 
 class GoalGuardConfig(BaseModel):
