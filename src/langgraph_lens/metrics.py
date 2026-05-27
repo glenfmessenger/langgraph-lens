@@ -120,11 +120,14 @@ def record_detection(det: Detection) -> None:
 _server_started = False
 
 
-def maybe_start_server(port: int) -> None:
+def maybe_start_server(port: int, bind_address: str = "127.0.0.1") -> None:
     """Start the Prometheus exporter if it isn't already up.
 
     In multiprocess servers, set PROMETHEUS_MULTIPROC_DIR before this
     is called so workers share metric files.
+
+    `bind_address` defaults to loopback because the exporter has no
+    auth and the metrics include per-thread labels.
     """
     global _server_started
     if _server_started:
@@ -137,5 +140,5 @@ def maybe_start_server(port: int) -> None:
     # Port already bound (e.g. another lens instance in the same process
     # tree) is treated as success — first one wins.
     with contextlib.suppress(OSError):
-        start_http_server(port)
+        start_http_server(port, addr=bind_address)
     _server_started = True

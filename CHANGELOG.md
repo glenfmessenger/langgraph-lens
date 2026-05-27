@@ -4,7 +4,88 @@ All notable changes to this project will be documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] — 2026-05-27
+
+### Added — zero-config integrations (closes the integration gap from v0.2)
+
+The LangChain `BaseCallbackHandler` only fires on chain entry/exit,
+tool calls, and LLM calls. Checkpoints, memory-store writes, and
+prompt loads happen outside that surface — meaning v0.2's
+`LANGGRAPH_LENS=1` Tier 1 feature table overstated what was actually
+wired in. This release closes the gap.
+
+- **`langgraph_lens.integrations.protect_saver(saver, lens=None)`** —
+  explicit per-instance wrap of any `BaseCheckpointSaver`. Swaps the
+  instance's class so `isinstance` still works; falls back to
+  in-place class patching for `__slots__`-based savers. Calls
+  `lens.decide_checkpoint(...)` on every `put` / `aput` /
+  `get_tuple` / `aget_tuple`.
+- **`langgraph_lens.integrations.install_saver_auto_protection()`** —
+  process-wide patch. Walks every imported `BaseCheckpointSaver`
+  subclass and patches its methods in place. Installs an
+  `__init_subclass__` hook so packages imported later (the user does
+  `from langgraph.checkpoint.postgres import PostgresSaver` after the
+  lens loads) also get patched. Called automatically by
+  `install_global_callback` when `LANGGRAPH_LENS=1` is set.
+- **`langgraph_lens.integrations.protect_store(store, lens=None)`** +
+  **`install_store_auto_protection()`** — same shape for `BaseStore`.
+  `put` / `aput` calls fire `lens.inspect_memory_write(...)`.
+- **`langgraph_lens.integrations.extract_topology(compiled_graph)`** —
+  walks a compiled `StateGraph` and returns declared `(from, to)`
+  edges. The `Lens.attach_graph(app)` convenience method calls this
+  and stores the result; afterwards the comms detector's
+  `undeclared_edge` rule fires automatically through the callback
+  path.
+- **Supply-chain auto-scan in `LensCallback.on_llm_start`** — every
+  rendered prompt the LLM is about to see goes through
+  `SupplyChainDetector.scan_text`. Catches SSTI signatures that
+  survived template rendering.
+- **Attack-surface auto-fire** — `Lens.scan_attack_surface(...)` now
+  runs once per process on the first node inspection, with
+  best-effort `RuntimeInfo` derived from env vars
+  (`LANGGRAPH_SERVER`, `LANGGRAPH_AUTH`, `LANGGRAPH_API_KEY`).
+- **`Lens.attach_graph(app)`** — new public API to register a
+  compiled graph's topology with the lens.
+
+Opt-out for auto-protection: set `LANGGRAPH_LENS_AUTO_PROTECT=0`.
+
+### Security hardening
+
+- **Prometheus bind address now defaults to `127.0.0.1`** (was
+  effectively `0.0.0.0` via `prometheus_client.start_http_server`'s
+  default). The exporter exposes per-thread detection counts and has
+  no built-in auth. New `PrometheusConfig.bind_address` field to
+  override.
+- **HMAC key validation.** `tier2.checkpoint_protector.require_hmac:
+  true` with an empty `signing_key` now raises at config load time
+  instead of silently HMAC-ing an empty key. New `model_validator`
+  on `CheckpointProtectorConfig`.
+
+### Added — tests
+
+- **`tests/integrations/test_checkpoint_protection.py`** — 7 cases
+  covering both explicit and auto-protection paths against
+  `MemorySaver`.
+- **`tests/integrations/test_store_protection.py`** — 4 cases
+  against `InMemoryStore`, including the `__slots__` fallback.
+- **`tests/integrations/test_topology.py`** — 3 cases including the
+  end-to-end `attach_graph → undeclared_edge fires` flow.
+- **`tests/integrations/test_zero_config_e2e.py`** — 4 cases proving
+  the README matrix's claims against a real compiled `StateGraph` +
+  `MemorySaver`.
+
+Total tests: 88 → 106.
+
+### Added — docs
+
+- README: new **"What you actually get with `LANGGRAPH_LENS=1`
+  today"** matrix. Honest about which detectors fire automatically,
+  which need a one-line opt-in, and which need manual calls.
+- README: new **Integrations** section with `protect_saver` /
+  `protect_store` / `attach_graph` examples plus the
+  `LANGGRAPH_LENS_AUTO_PROTECT=0` opt-out.
+
+## [0.2.1] — 2026-05-27
 
 ### Added
 

@@ -33,6 +33,25 @@ There are two tiers:
 
 `LANGGRAPH_LENS=1` with no config gets you Tier 1 only. Tier 2 requires an explicit YAML opt-in per feature. Nothing is suppressed without you asking for it.
 
+### What you actually get with `LANGGRAPH_LENS=1` today
+
+The LangChain callback handler only fires on chain entry / exit, tool calls, and LLM calls. Checkpoints, memory-store writes, and prompt loads happen outside that surface. Since `v0.3.0`, the global install also patches `BaseCheckpointSaver` and `BaseStore` subclasses so the integration gap is closed for the common cases.
+
+| Detector | Fires automatically? | Trigger |
+|---|---|---|
+| **PII** (node ingress + final egress) | ✅ Yes | `LensCallback.on_chain_start` / `on_chain_end` |
+| **Goal hijack** (system-prompt drift, tool-call drift) | ✅ Yes | `on_chain_start` |
+| **Tool misuse** (shell metachar, SSRF, allowlist, enumeration) | ✅ Yes | `on_tool_start` |
+| **Supply chain** — rendered prompt at LLM call | ✅ Yes (new in v0.3) | `on_llm_start` — scans the prompt text the LLM actually sees |
+| **Supply chain** — static prompt files at load time | ⚠️ Manual | `lens.scan_prompt(path)` or `langgraph-lens scan-prompt …` |
+| **Checkpoint anomaly + SQL injection in metadata** | ✅ Yes (new in v0.3) | Auto-patched `BaseCheckpointSaver.put/aput/get_tuple/aget_tuple`. Set `LANGGRAPH_LENS_AUTO_PROTECT=0` to opt out. |
+| **Memory poisoning** | ✅ Yes (new in v0.3) | Auto-patched `BaseStore.put/aput`. Same opt-out env var. |
+| **Comms** — `recursion_exceeded`, `oversized_state_growth` | ✅ Yes | `on_chain_start` |
+| **Comms** — `undeclared_edge`, `send_to_undeclared_target` | ⚠️ Manual | `lens.attach_graph(app)` once, then automatic |
+| **Attack surface** (boot scan) | ✅ Yes (new in v0.3) | Fires once on the first node inspection per process with auto-detected env hints |
+
+Honest about the limit: the checkpoint dict that `put()` receives is not yet serialised, so the byte-level `unsafe_pickle_opcode` rule **does not fire on the write path**. It only fires when you hand the lens raw bytes (`langgraph-lens scan-checkpoint thread.jsonl`) or when a saver's serde returns bytes the lens can inspect. The dict-level rules (`schema_drift`, `missing_thread_id`, `oversized_blob`, SQL injection in `metadata.thread_id` / `checkpoint_ns` / `checkpoint_id`) DO fire on every write.
+
 ---
 
 ## Why
@@ -422,6 +441,92 @@ Full per-rule numbers, microbenchmarks, and the test-rig spec are in [`bench/RES
 pip install -e ".[dev]"
 python bench/bench.py --markdown
 ```
+
+---
+
+## Integrations
+
+When `LANGGRAPH_LENS=1` is set, the package patches `BaseCheckpointSaver` and `BaseStore` subclasses at import time so existing `graph.compile(checkpointer=PostgresSaver(...))` and `BaseStore.put(...)` calls flow through `lens.decide_checkpoint(...)` and `lens.inspect_memory_write(...)` automatically. No source-code changes required.
+
+### Usage with real savers
+
+```python
+# Zero-config — auto-protected via the global install.
+import os
+os.environ["LANGGRAPH_LENS"] = "1"
+import langgraph_lens  # noqa: F401 -- import side-effect installs the patches
+
+from langgraph.checkpoint.postgres import PostgresSaver
+saver = PostgresSaver.from_conn_string("postgresql://...")
+# `saver` is now auto-protected. Every put/aput/get_tuple/aget_tuple
+# call goes through the lens. No further changes needed.
+```
+
+```python
+# Explicit per-instance wrap — useful when you want a specific lens
+# bound to a specific saver, or you don't want the global patch.
+from langgraph_lens import Lens, LensConfig
+from langgraph_lens.integrations import protect_saver
+from langgraph.checkpoint.sqlite import SqliteSaver
+
+lens = Lens(LensConfig.from_yaml("lens.yaml"))
+saver = protect_saver(SqliteSaver.from_conn_string("checkpoints.db"), lens)
+app = graph.compile(checkpointer=saver)
+```
+
+To turn off auto-protection (e.g. you want manual control or you're seeing a class-patching incompatibility), set `LANGGRAPH_LENS_AUTO_PROTECT=0`.
+
+### Supply chain protection
+
+The supply-chain detector now has two trigger paths:
+
+1. **Automatic — rendered prompt at LLM call.** `LensCallback.on_llm_start` scans the prompt text the LLM is about to see for Jinja2 SSTI signatures. Catches anything that survived template rendering.
+2. **Manual — static prompt files at load time.** `lens.scan_prompt("./prompts/")` or the CLI `langgraph-lens scan-prompt ./prompts/`. Catches malicious templates *before* they hit the runtime — the recommended path for prompt-registry intake / CI.
+
+```python
+# In your prompt-registry-sync script
+from langgraph_lens import Lens, LensConfig
+
+lens = Lens(LensConfig.default())
+event = lens.scan_prompt("./prompts/")
+critical = [d for d in event.detections if d.severity.value == "critical"]
+if critical:
+    raise RuntimeError(f"refusing to sync prompts: {critical}")
+```
+
+### Memory-store integration
+
+```python
+# Zero-config — auto-protected via the global install.
+from langgraph.store.memory import InMemoryStore  # or any BaseStore subclass
+store = InMemoryStore()
+store.put(("agent", "memory"), "user_pref", {"text": "..."})
+# That call already ran through lens.inspect_memory_write.
+```
+
+```python
+# Explicit per-instance wrap.
+from langgraph_lens.integrations import protect_store
+store = protect_store(InMemoryStore(), lens)
+```
+
+### Topology checks for the comms detector
+
+The `undeclared_edge` and `send_to_undeclared_target` rules need the static graph topology. One line opts in:
+
+```python
+from langgraph_lens import Lens, LensCallback, LensConfig
+
+lens = Lens(LensConfig.default())
+app = graph.compile(checkpointer=MemorySaver())
+lens.attach_graph(app)  # extract declared edges from the compiled graph
+```
+
+After `attach_graph`, the comms rules fire automatically on every node entry.
+
+### Prometheus binding
+
+Defaults to `127.0.0.1:9092`. If you need to scrape from another host, set `prometheus.bind_address: 0.0.0.0` in `lens.yaml` and put the port behind a reverse proxy or a network ACL — the exporter has no built-in auth.
 
 ---
 

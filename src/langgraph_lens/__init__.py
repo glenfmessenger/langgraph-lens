@@ -30,7 +30,7 @@ __all__ = [
     "wrap_node",
 ]
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 
 if os.environ.get("LANGGRAPH_LENS") == "1":

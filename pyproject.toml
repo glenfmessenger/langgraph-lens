@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "langgraph-lens"
-version = "0.2.0"
+version = "0.3.0"
 description = "Zero-config runtime observability for LangGraph agents: checkpoint, prompt-supply-chain, tool, memory, PII, goal-hijack, inter-agent, and SQL-injection detectors emitted as structured events."
 readme = "README.md"
 requires-python = ">=3.10"
