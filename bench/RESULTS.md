@@ -84,6 +84,46 @@ opcode scan; this is the floor.
 | Tier 2 — `checkpoint_protector` | 5.3 µs |
 | Tier 2 — `checkpoint_protector + require_hmac` | 6.8 µs |
 
-## Cross-reference — Linux x86
+## Cross-reference — Linux x86 (Oracle Cloud A100 instance)
 
-_(To be populated by the Ubuntu / A100 run.)_
+Same `bench.py`, different rig.
+
+- BM.GPU.A100-v2.8-equivalent shape, single Linux x86_64 worker
+- Ubuntu 22.04, kernel 6.8.0, Python 3.10.12
+- LangGraph and LangChain Core installed from the `[langgraph]` extra at run time
+
+The A100 itself does not accelerate this benchmark — the lens is CPU-bound Python, and this VM's per-core Python performance is slower than the M2's, which is why absolute latencies are roughly 2-4× higher. The *relative* costs are the same, which is the point of the cross-reference.
+
+### 5-node graph, ~4 KB state — no-op nodes
+
+| Configuration | p50 latency | Overhead (p50) | Throughput drop |
+|---|---|---|---|
+| baseline (no lens) | 4.73 ms | — | — |
+| Tier 1 — callback handler | 5.46 ms | +0.73 ms | +13.3% |
+| Tier 1 — direct `Lens.inspect_node` | 5.22 ms | +0.49 ms | +10.2% |
+| Tier 2 — `audit_signaling` only | 5.14 ms | +0.41 ms | +8.1% |
+| Tier 2 — `goal_guard` | 5.12 ms | +0.40 ms | +7.7% |
+| Tier 2 — `pii_redaction` | 6.72 ms | +1.99 ms | +29.6% |
+| Tier 2 — all node-path features | 6.75 ms | +2.02 ms | +29.8% |
+
+### Realistic workload — 5 nodes × 10 ms simulated work (200 iterations)
+
+| Configuration | p50 latency | Overhead (p50) | Throughput drop |
+|---|---|---|---|
+| realistic baseline | 55.85 ms | — | — |
+| realistic + Tier 1 callback handler | 56.92 ms | +1.08 ms | **+1.9%** |
+| realistic + Tier 2 (all node-path features) | 58.06 ms | +2.21 ms | **+3.9%** |
+
+Within margin of the M2 numbers (+1.9% / +4.4%). The framing in the README holds on both rigs.
+
+### Tool call / checkpoint micros (Linux)
+
+| Configuration | p50 / call |
+|---|---|
+| Tier 1 — `inspect_tool_call` | 75.7 µs |
+| Tier 2 — `tool_allowlist` | 298.9 µs |
+| Tier 2 — `rate_limit` | 105.3 µs |
+| Tier 2 — all tool-path features | 314.6 µs |
+| Tier 1 — `inspect_checkpoint` | 14.1 µs |
+| Tier 2 — `checkpoint_protector` | 23.4 µs |
+| Tier 2 — `checkpoint_protector + require_hmac` | 30.7 µs |
