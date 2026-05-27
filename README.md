@@ -1,6 +1,8 @@
 # langgraph-lens
 
 [![CI](https://github.com/glenfmessenger/langgraph-lens/actions/workflows/ci.yml/badge.svg)](https://github.com/glenfmessenger/langgraph-lens/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/langgraph-lens.svg)](https://pypi.org/project/langgraph-lens/)
+[![Python](https://img.shields.io/pypi/pyversions/langgraph-lens.svg)](https://pypi.org/project/langgraph-lens/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
 Zero-config runtime observability for LangGraph agents, with opt-in interventions for teams that need to block, redact, or rate-limit.
@@ -20,18 +22,6 @@ You'll get a `supply_chain/jinja_ssti` detection at severity `critical` and a no
 
 ---
 
-## Why
-
-**February 2026 LangGraph checkpoint RCEs.** On 25 February 2026, **CVE-2026-27794** was disclosed — a remote code execution vulnerability in the LangGraph checkpoint caching layer caused by unsafe pickle fallback in `JsonPlusSerializer`. A follow-up issue (**CVE-2026-28277**) exposed unsafe msgpack deserialization in checkpoint loading. Any operator using persistent checkpoints (Postgres, SQLite, Redis, etc.) who allowed untrusted or multi-tenant thread resumption was affected. langgraph-lens detects and logs unsafe pickle opcodes and unknown serializer kinds in every checkpoint it sees, before the runtime hands them to the deserialiser.
-
-**Supply-chain risk in shared prompt registries — CVE-2026-34070.** LangChain Hub and self-hosted prompt registries distribute Jinja2 chat templates as opaque text. **CVE-2026-34070** (March 2026) allows path traversal and unsafe Jinja2 SSTI when `ChatPromptTemplate.from_template(..., template_format="jinja2")` renders a malicious template. langgraph-lens scans every prompt on load and emits a structured event for any pattern matching known-bad template signatures or path-traversal sequences in the loader call.
-
-**Compliance requirements that post-hoc log scraping can't satisfy.** Regulated environments need an auditable record that PII was *observed leaving an agent*, with correlation IDs that match the originating run, thread, and node. Tailing LangGraph Server's access logs after the fact doesn't produce this — the agent's intermediate state is opaque to the proxy. langgraph-lens emits per-node and per-checkpoint events with stable correlation IDs derived from `run_id` and `thread_id`, and Tier 2 attaches `X-Lens-Triggered: true` + `X-Lens-Reason` headers (or a `state["__lens__"]` annotation) so downstream callers know inline.
-
-This is not a safety system. It does not provide probabilistic guarantees against adversarial prompts or agent misbehaviour. It provides **operational visibility and runtime instrumentation**, plus a small number of opt-in hard controls for teams that need them.
-
----
-
 ## What it does
 
 langgraph-lens runs as a callback handler inside the LangGraph runtime. The primary path is a `BaseCallbackHandler` subclass registered globally via `LANGGRAPH_LENS=1`; the fallback path is a manual `Lens` instance attached to a specific compiled graph via `graph.with_config({"callbacks": [LensCallback(lens)]})`.
@@ -42,6 +32,18 @@ There are two tiers:
 - **Tier 2 (interventions)** is off by default. Each intervention has its own `enabled: false` flag. When enabled, an intervention may block a node, rewrite its state (PII redaction), throttle tool calls, refuse to deserialise a checkpoint, or attach `X-Lens-Triggered` headers to the response.
 
 `LANGGRAPH_LENS=1` with no config gets you Tier 1 only. Tier 2 requires an explicit YAML opt-in per feature. Nothing is suppressed without you asking for it.
+
+---
+
+## Why
+
+**February 2026 LangGraph checkpoint RCEs.** On 25 February 2026, **CVE-2026-27794** was disclosed — a remote code execution vulnerability in the LangGraph checkpoint caching layer caused by unsafe pickle fallback in `JsonPlusSerializer`. A follow-up issue (**CVE-2026-28277**) exposed unsafe msgpack deserialization in checkpoint loading. Any operator using persistent checkpoints (Postgres, SQLite, Redis, etc.) who allowed untrusted or multi-tenant thread resumption was affected. langgraph-lens detects and logs unsafe pickle opcodes and unknown serializer kinds in every checkpoint it sees, before the runtime hands them to the deserialiser.
+
+**Supply-chain risk in shared prompt registries — CVE-2026-34070.** LangChain Hub and self-hosted prompt registries distribute Jinja2 chat templates as opaque text. **CVE-2026-34070** (March 2026) allows path traversal and unsafe Jinja2 SSTI when `ChatPromptTemplate.from_template(..., template_format="jinja2")` renders a malicious template. langgraph-lens scans every prompt on load and emits a structured event for any pattern matching known-bad template signatures or path-traversal sequences in the loader call.
+
+**Compliance requirements that post-hoc log scraping can't satisfy.** Regulated environments need an auditable record that PII was *observed leaving an agent*, with correlation IDs that match the originating run, thread, and node. Tailing LangGraph Server's access logs after the fact doesn't produce this — the agent's intermediate state is opaque to the proxy. langgraph-lens emits per-node and per-checkpoint events with stable correlation IDs derived from `run_id` and `thread_id`, and Tier 2 attaches `X-Lens-Triggered: true` + `X-Lens-Reason` headers (or a `state["__lens__"]` annotation) so downstream callers know inline.
+
+This is not a safety system. It does not provide probabilistic guarantees against adversarial prompts or agent misbehaviour. It provides **operational visibility and runtime instrumentation**, plus a small number of opt-in hard controls for teams that need them.
 
 ---
 
@@ -403,80 +405,23 @@ Alerts default to `supply_chain`, `attack_surface`, and `checkpoint` only. PII a
 
 ## Performance
 
-All numbers below are measured by `bench/bench.py` — no estimates. To reproduce, run:
+The lens cost is roughly fixed at **~0.4 ms / `invoke` for Tier 1** and **~1 ms with all Tier 2 node-path features**. Percentage impact scales inversely with how much real work the nodes do:
+
+| Per-node work | Approx. invoke time | Tier 1 drop | All Tier 2 drop |
+|---|---|---|---|
+| Counter bump (synthetic) | ~1.4 ms | ~22% | ~40% |
+| 10 ms (cached lookup, tiny model) — **measured** | ~67 ms | ~2% | ~4% |
+| 100 ms (DB query, embedding) | ~500 ms | ~0.3% | ~1% |
+| 1 s (LLM call) | ~5 s | ~0.03% | ~0.1% |
+
+A real LangGraph deployment — anything that calls an LLM — sees the lens overhead disappear into the LLM round-trip. The synthetic worst case (`+22%`) measures the lens against nodes that do nothing.
+
+Full per-rule numbers, microbenchmarks, and the test-rig spec are in [`bench/RESULTS.md`](bench/RESULTS.md). Reproduce with:
 
 ```bash
 pip install -e ".[dev]"
 python bench/bench.py --markdown
 ```
-
-**Test rig:** Apple M2 (8 cores), 8 GiB RAM, macOS 26.5, Python 3.13.7, LangGraph 1.2.1, LangChain Core 1.4.0. 2000 iterations per row, 200-iteration warm-up, GC disabled inside the timed loop. Single-threaded. Local laptop, not a production-class box — your absolute numbers will differ, but the *relative* costs (callback vs direct, with/without each Tier 2 feature) should be representative.
-
-### How to read these numbers
-
-The lens cost is **roughly fixed at ~0.4 ms per `invoke` for Tier 1 and ~1 ms with all Tier 2 node-path features enabled** — it does not scale with the work your nodes do. So the percentage impact depends entirely on how much real work the nodes do:
-
-| Per-node work | Approx. invoke time | Tier 1 callback drop | All Tier 2 drop |
-|---|---|---|---|
-| Trivial (counter bump — synthetic bench below) | ~1.4 ms | ~22% | ~40% |
-| 10 ms each (cached lookup, tiny inference) | ~67 ms | ~2% | ~4% (measured below) |
-| 100 ms each (small DB query, embedding) | ~500 ms | ~0.3% | ~1% (extrapolated) |
-| 1 s each (LLM call) | ~5 s | ~0.03% | ~0.1% (extrapolated) |
-
-The headline `+21.6%` Tier 1 number in the synthetic table below is a worst case: it measures the lens overhead against nodes that do nothing. A real LangGraph deployment with even a single LLM call per node — which is the entire point of LangGraph — sees the lens overhead disappear into the noise of the LLM round-trip. The realistic-workload row, which simulates 10 ms of node work, brings that ~22% down to ~2% — and even 10 ms is much less than a real LLM call.
-
-If you are running a CPU-bound, no-LLM, no-I/O agent where every microsecond counts, prefer direct `lens.inspect_node(...)` calls (saves a few percentage points vs the callback) and leave `pii_redaction` off (it's the single most expensive Tier 2 feature — deep-copies state and re-serialises it). Otherwise, leave it on.
-
-### Synthetic: 5-node graph, ~4 KB state, no-op nodes
-
-One full `app.invoke(...)` on a `StateGraph` with five sequential nodes and a `MemorySaver`. Baseline is the same graph with no lens at all. **The "% drop" column is misleading in isolation** — see above for how it maps to real workloads.
-
-| Configuration | p50 latency | Overhead (p50) | Throughput drop |
-|---|---|---|---|
-| baseline (no lens) | 1.36 ms | — | — |
-| Tier 1 — callback handler | 1.75 ms | +0.39 ms | +21.6% |
-| Tier 1 — direct `Lens.inspect_node` in each node | 1.64 ms | +0.28 ms | +16.2% |
-| Tier 2 — `audit_signaling` only | 1.61 ms | +0.24 ms | +14.6% |
-| Tier 2 — `goal_guard` | 1.59 ms | +0.22 ms | +12.6% |
-| Tier 2 — `pii_redaction` | 2.31 ms | +0.95 ms | +40.1% |
-| Tier 2 — all node-path features (`audit + goal + pii + circuit`) | 2.31 ms | +0.95 ms | +40.3% |
-
-Why callback ≥ direct: LangChain's callback manager dispatches a `RunManager` for every chain boundary. `LensCallback` already filters to real LangGraph nodes (via the `langgraph_node` metadata key) and only fires the egress event once at the outer run boundary — without that filter the call count is 12 per invoke instead of 6, and the cost roughly doubles.
-
-### Realistic: same graph, 10 ms simulated work per node
-
-Each node sleeps 10 ms before returning, simulating the floor of a real LangGraph deployment (cached lookup, tiny model). At 200 iterations because each invoke takes ~67 ms.
-
-| Configuration | p50 latency | Overhead (p50) | Throughput drop |
-|---|---|---|---|
-| realistic baseline (10 ms / node) | 67.19 ms | — | — |
-| realistic + Tier 1 callback handler | 68.40 ms | +1.21 ms | +1.9% |
-| realistic + Tier 2 (all node-path features) | 70.28 ms | +3.09 ms | +4.4% |
-
-For an LLM-backed agent with 500 ms-3 s of LLM time per node, those percentages shrink by another order of magnitude. **In practice the question is "do I want the observability and the controls" — not "can I afford the latency."**
-
-### Standalone Tier 1 / Tier 2 cost — single tool call
-
-These rows are the absolute cost of one `lens.inspect_tool_call(...)` or `lens.decide_tool_call(...)`. There is no meaningful "baseline" — a tool call without the lens is a no-op — so latencies are reported in microseconds rather than as a percentage delta.
-
-| Configuration | p50 latency / call |
-|---|---|
-| Tier 1 — `inspect_tool_call` | 25.6 µs |
-| Tier 2 — `tool_allowlist` (via `decide_tool_call`) | 77.2 µs |
-| Tier 2 — `rate_limit` (via `decide_tool_call`) | 26.5 µs |
-| Tier 2 — all tool-path features (`allowlist + rate_limit + circuit + audit`) | 82.1 µs |
-
-`tool_allowlist` is the most expensive tool-path intervention because it re-runs the entire Tier 1 misuse-detection set (shell-metachar, SSRF, oversized args) against the args. `rate_limit` is essentially free.
-
-### Standalone Tier 1 / Tier 2 cost — single checkpoint
-
-A 60-byte JSON checkpoint blob (no pickle, no large state). The cost scales with blob size for the opcode scan; this is the floor.
-
-| Configuration | p50 latency / checkpoint |
-|---|---|
-| Tier 1 — `inspect_checkpoint` | 3.4 µs |
-| Tier 2 — `checkpoint_protector` | 5.3 µs |
-| Tier 2 — `checkpoint_protector + require_hmac` | 6.8 µs |
 
 ---
 

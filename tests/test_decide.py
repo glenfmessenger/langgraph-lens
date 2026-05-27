@@ -98,7 +98,7 @@ def test_wrap_node_redacts_before_node_runs() -> None:
         {"messages": [{"role": "user", "content": "SSN 123-45-6789"}]},
         config={"configurable": {"thread_id": "t"}},
     )
-    assert seen == ["My SSN is redacted (placeholder)"] or "[REDACTED:ssn]" in seen[0]
+    assert "[REDACTED:ssn]" in seen[0]
 
 
 def test_wrap_node_raises_on_block() -> None:
