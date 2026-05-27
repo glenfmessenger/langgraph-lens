@@ -1,0 +1,52 @@
+name: Release to PyPI
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tooling
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build twine
+
+      - name: Build sdist + wheel
+        run: python -m build
+
+      - name: Twine check
+        run: twine check dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    # The `release` environment is configured in repo Settings → Environments
+    # with a Required Reviewer (Glen). The publish job pauses until manual
+    # approval — accidental tag pushes can't ship a release.
+    environment: release
+    permissions:
+      # OIDC token for the PyPI trusted-publisher handshake. No PYPI_API_TOKEN
+      # secret is needed; PyPI verifies the GitHub-issued OIDC token against
+      # the project's configured trusted publisher (owner=glenfmessenger,
+      # repo=langgraph-lens, workflow=release.yml, environment=release).
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
