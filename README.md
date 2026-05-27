@@ -444,7 +444,7 @@ langgraph-lens version
 ## Requirements
 
 - Python ≥ 3.10 (tested locally on 3.13; CI runs 3.10 / 3.11 / 3.12)
-- LangGraph ≥ 0.2.50 declared as the minimum, but verified against LangGraph 1.2.1 + LangChain Core 1.4.0 only. Older versions may work — the `BaseCallbackHandler` interface has been stable since 0.2.50 — but are untested.
+- Verified against **LangGraph 1.2.x + LangChain Core 1.4.0** on Python 3.10 / 3.11 / 3.12 / 3.13. The `pyproject.toml` constraint of `langgraph>=1.0` reflects the tested range, not a verified compatibility floor — older 1.0 / 1.1 versions may work but are not exercised in CI.
 - Optional: `langgraph-checkpoint-postgres` or `langgraph-checkpoint-sqlite` if you want the SQL-injection detector wired into the actual saver call. The detector is unit-tested against synthetic metadata; the real-saver path is not tested.
 
 ## Maintenance and compatibility
@@ -468,13 +468,15 @@ ruff check src/
 mypy src/langgraph_lens/
 ```
 
-68 pytest cases in total. Coverage is *uneven across rules* — every detector has at least one positive test, but not every rule within a detector does. The honest breakdown:
+88 pytest cases in total. Coverage is *uneven across rules* — every detector has at least one positive test, but not every rule within a detector does. The honest breakdown:
 
-- **Tier 1 detectors** — every detector module has positive tests for its most-load-bearing rules. Some lower-severity or harder-to-trigger rules (e.g. `unsafe_chat_template`, `unsigned_hub_pull`, `oversized_blob`, `unknown_serializer_kind`, `off_topic_subgoal`, `tool_call_drift`, `send_to_undeclared_target`, `oversized_state_growth`, three of four SQL-injection rules) ship without an explicit positive test. They're exercised through the static rule list in the detector code, but a contribution adding direct tests is welcome.
+- **Tier 1 detectors** — every detector module has positive tests for its most-load-bearing rules. The following rules ship without an explicit positive test, exercised only via the static rule list in the detector code: `unsafe_chat_template`, `unsigned_hub_pull`, `oversized_blob`, `unknown_serializer_kind`, `tool_call_drift`, `send_to_undeclared_target`, `oversized_state_growth`, and three of the four SQL-injection rules (`comment_terminator`, `stacked_query`, `metadata_escape`). A contribution adding direct tests is welcome.
 - **Lens orchestrator** (`tests/test_lens.py`, `test_config.py`) — correlation IDs, state hashing, YAML roundtrip, defaults invariant.
+- **CLI surface** (`tests/test_cli.py`) — every subcommand: `validate`, `version`, `scan-prompt` (clean directory + the canary), `scan-checkpoint` (clean + pickle-tainted JSONL), `check` (live HTTP stub + metrics-absent + unreachable-port).
 - **Tier 2 interventions** (`tests/interventions/`) — every intervention has positive tests for both modes (`block`/`log` or `redact`/`throttle`) and the disabled-passthrough case. The PII redactor specifically verifies multi-pattern messages and the deep-copy property (caller's state is not mutated). The checkpoint protector exercises the HMAC sign/verify roundtrip plus the mismatched-HMAC block path.
-- **Decision composition** (`tests/test_decide.py`) — the orchestration path through `Lens.decide_node` / `decide_tool_call` / `decide_checkpoint`: short-circuit on block, header merging, audit-headers-absent-when-nothing-fires, `wrap_node` redaction round-trip, `wrap_node` raising `LensBlockedError`, and the attack-signal feed into the circuit breaker.
-- **Real-graph end-to-end** — `bench/bench.py` builds an actual compiled `StateGraph` with `MemorySaver` and exercises the callback path, the direct `inspect_node` path, and the `wrap_node` redaction path for every Tier 2 feature. It runs ~6.8 k iterations of `app.invoke(...)` per full benchmark pass.
+- **Decision composition** (`tests/test_decide.py`) — the orchestration path through `Lens.decide_node` / `decide_tool_call` / `decide_checkpoint`: short-circuit on block, header merging, audit-headers-absent-when-nothing-fires, `wrap_node` redaction round-trip (including the context-var thread_id fallback), `wrap_node` raising `LensBlockedError`, and the attack-signal feed into the circuit breaker.
+- **Real-graph end-to-end** — `bench/bench.py` builds an actual compiled `StateGraph` with `MemorySaver` and exercises the callback path, the direct `inspect_node` path, and the `wrap_node` redaction path for every Tier 2 feature. A full pass runs ~16 k `app.invoke(...)` calls (2000 timed + 200 warmup per synthetic row across 7 rows, plus 200 + 200 per realistic row across 3 rows).
+- **Real-LLM end-to-end** — `examples/with_real_llm.py` verified against live OpenAI `gpt-4o-mini`: a user message containing an SSN reaches the wrapped `chat` node as `[REDACTED:ssn]`, the model's response confirms it could not see or echo the original value. Not in CI (no API key); reproducible with `OPENAI_API_KEY=... python examples/with_real_llm.py`.
 
 ---
 

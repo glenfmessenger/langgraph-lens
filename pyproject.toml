@@ -30,8 +30,8 @@ dependencies = [
 
 [project.optional-dependencies]
 langgraph = [
-    "langgraph>=0.2.50",
-    "langchain-core>=0.3.0",
+    "langgraph>=1.0",
+    "langchain-core>=1.0",
 ]
 otel = [
     "opentelemetry-api>=1.24",
@@ -51,8 +51,8 @@ dev = [
     # subclassing Any. langgraph is needed by the benchmark and the
     # end-to-end examples. Runtime users who don't use callbacks don't
     # need either.
-    "langchain-core>=0.3.0",
-    "langgraph>=0.2.50",
+    "langchain-core>=1.0",
+    "langgraph>=1.0",
 ]
 
 [project.scripts]
