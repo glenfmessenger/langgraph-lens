@@ -405,14 +405,14 @@ Alerts default to `supply_chain`, `attack_surface`, and `checkpoint` only. PII a
 
 ## Performance
 
-The lens cost is roughly fixed at **~0.4 ms / `invoke` for Tier 1** and **~1 ms with all Tier 2 node-path features**. Percentage impact scales inversely with how much real work the nodes do:
+The lens adds a fixed per-`invoke` overhead — **+0.39 ms** for Tier 1 callback, **+0.95 ms** with all Tier 2 node-path features (Apple M2; +0.73 ms / +2.02 ms on Linux A100, both measured). That cost doesn't grow with how much real work your nodes do, so the percentage impact shrinks as the workload grows. Two measured rows:
 
-| Per-node work | Approx. invoke time | Tier 1 drop | All Tier 2 drop |
+| Per-node work | Invoke time | Tier 1 callback | All Tier 2 |
 |---|---|---|---|
-| Counter bump (synthetic) | ~1.4 ms | ~22% | ~40% |
-| 10 ms (cached lookup, tiny model) — **measured** | ~67 ms | ~2% | ~4% |
-| 100 ms (DB query, embedding) | ~500 ms | ~0.3% | ~1% |
-| 1 s (LLM call) | ~5 s | ~0.03% | ~0.1% |
+| Counter bump (synthetic, no-op) | 1.36 ms | +0.39 ms / **+21.6%** | +0.95 ms / **+40.3%** |
+| 10 ms simulated work per node | 67.19 ms | +1.21 ms / **+1.9%** | +3.09 ms / **+4.4%** |
+
+For a workload heavier than 10 ms / node, you can compute the impact from the fixed cost (lens adds 0.4–1 ms total per invoke regardless of node work). A 100 ms / node workload — typical for a small DB query or embedding call — works out to roughly +0.4% / +1% drop. A 1 s / node workload — a single LLM call — works out to roughly +0.04% / +0.1%. Run `bench/bench.py` against your own graph if you need exact numbers; the rows above are the only ones with a measured baseline in this repo.
 
 A real LangGraph deployment — anything that calls an LLM — sees the lens overhead disappear into the LLM round-trip. The synthetic worst case (`+22%`) measures the lens against nodes that do nothing.
 
