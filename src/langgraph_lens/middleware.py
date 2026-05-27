@@ -285,6 +285,15 @@ def wrap_node(
 
         graph.add_node("act", wrap_node(lens, act, node="act"))
 
+    **Gotcha — accept `config` in your node signature** if you want
+    events bucketed under the originating `thread_id`. LangGraph only
+    passes `config: RunnableConfig` to nodes whose signature accepts
+    it; if your node is `def act(state):` then this wrapper has no
+    way to recover the thread_id and events are bucketed under
+    `thread_id=None`. Redaction and blocking still work — they don't
+    need the thread_id — but `lens.events_for_thread(...)` won't see
+    them.
+
     Idempotent: applying `wrap_node` twice is harmless — the inner
     wrapper short-circuits when it sees its own marker attribute.
     """
@@ -293,7 +302,30 @@ def wrap_node(
 
     @functools.wraps(fn)
     def _wrapped(state: dict[str, Any], *args: Any, **kwargs: Any) -> Any:
-        config = kwargs.get("config") if isinstance(kwargs.get("config"), dict) else {}
+        # LangGraph may pass `config` positionally, as a kwarg, or not
+        # at all (when the wrapped node's signature doesn't accept it).
+        # In the last case fall back to LangChain Core's context var,
+        # which the Pregel engine sets before invoking each node — this
+        # is the same mechanism callbacks use internally.
+        config: dict[str, Any] | None = kwargs.get("config")
+        if not isinstance(config, dict):
+            config = None
+        if config is None:
+            for arg in args:
+                if isinstance(arg, dict) and "configurable" in arg:
+                    config = arg
+                    break
+        if config is None:
+            try:
+                from langchain_core.runnables.config import (
+                    var_child_runnable_config,
+                )
+
+                ctx = var_child_runnable_config.get()
+                if isinstance(ctx, dict):
+                    config = dict(ctx)
+            except (ImportError, LookupError):
+                pass
         configurable = (config or {}).get("configurable") or {}
         thread_id = configurable.get("thread_id") if isinstance(configurable, dict) else None
         decision, _event = lens.decide_node(

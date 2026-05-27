@@ -101,6 +101,37 @@ def test_wrap_node_redacts_before_node_runs() -> None:
     assert "[REDACTED:ssn]" in seen[0]
 
 
+def test_wrap_node_discovers_thread_id_via_context_var() -> None:
+    """When LangGraph doesn't pass `config` to the node (because the
+    node's signature doesn't accept it), wrap_node should fall back to
+    LangChain Core's `var_child_runnable_config` context var — which
+    is what the Pregel engine populates before invoking each node.
+    """
+    pytest.importorskip("langchain_core")
+    from langchain_core.runnables.config import var_child_runnable_config
+
+    lens = _lens_with(pii_redaction=True)
+
+    def act(state: dict) -> dict:  # no config kwarg
+        return state
+
+    wrapped = wrap_node(lens, act, node="act")
+
+    token = var_child_runnable_config.set(
+        {"configurable": {"thread_id": "ctx-thread"}}
+    )
+    try:
+        wrapped({"messages": [{"role": "user", "content": "SSN 123-45-6789"}]})
+    finally:
+        var_child_runnable_config.reset(token)
+
+    events = lens.events_for_thread("ctx-thread")
+    assert events, "no events bucketed under the context-var thread_id"
+    assert any(
+        d.detector == "pii_redactor" for e in events for d in e.detections
+    )
+
+
 def test_wrap_node_raises_on_block() -> None:
     cfg = LensConfig.default()
     cfg.prometheus.enabled = False
